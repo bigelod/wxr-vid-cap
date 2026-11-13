@@ -24,6 +24,7 @@
 #include "exclusions.h"
 #include "h264_encoder.h"
 #include "hook_capture.h"
+#include "injection.h"
 #include "mkv_writer.h"
 #include "opus_audio_encoder.h"
 #include "process_list.h"
@@ -113,38 +114,135 @@ bool TargetStillPresent(const std::wstring& executable, unsigned long processId)
     return false;
 }
 
-// Batches muxer output into seven-packet datagrams, the size that fits a 1500-byte MTU.
-class UdpTsSink final : public TsSink {
+// Collects each muxed video frame's TS packets and sends them from a dedicated thread at a steady
+// cadence. The small queue absorbs capture/encode overruns and network jitter; it does not change
+// the transport (still UDP) and only adds receiving-side latency.
+class FrameQueueSink final : public TsSink {
 public:
-    explicit UdpTsSink(UdpSender& sender) : sender_(sender) {}
+    FrameQueueSink(UdpSender& sender, int jitterFrames)
+        : sender_(sender),
+          jitterFrames_(std::max(jitterFrames, 0)),
+          maxFrames_(std::max<std::size_t>(24, static_cast<std::size_t>(jitterFrames_) * 3)),
+          frameDuration_(std::chrono::microseconds(1000000 / kCaptureFps)),
+          jitterDelay_(frameDuration_ * jitterFrames_),
+          senderThread_([this]() { SendLoop(); })
+    {
+    }
+
+    ~FrameQueueSink() override
+    {
+        Stop();
+    }
+
+    void BeginFrame()
+    {
+        current_.clear();
+    }
 
     void OnTsPacket(const std::uint8_t* packet) override
     {
-        std::memcpy(buffer_.data() + buffered_ * TsMuxer::kPacketSize, packet, TsMuxer::kPacketSize);
-        ++buffered_;
-        if (buffered_ == kPacketsPerBuffer) {
-            Flush();
-        }
+        current_.insert(current_.end(), packet, packet + TsMuxer::kPacketSize);
     }
 
-    void Flush()
+    // Returns true when the oldest queued frame had to be dropped to make room.
+    bool EndFrame()
     {
-        if (buffered_ == 0) {
-            return;
+        if (current_.empty()) {
+            return false;
         }
-        if (!sender_.SendTsPackets(buffer_.data(), buffered_) && sendFailures_++ == 0) {
-            OutputDebugStringW(L"wxr-vid-cap cast: a UDP send failed; continuing to send.\n");
+
+        bool overflowed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (queue_.size() >= maxFrames_) {
+                queue_.pop_front();
+                overflowed = true;
+            }
+            queue_.push_back(std::move(current_));
+            current_.clear();
         }
-        buffered_ = 0;
+        cv_.notify_one();
+        return overflowed;
+    }
+
+    void Stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopped_) {
+                return;
+            }
+            stopped_ = true;
+            queue_.clear();
+        }
+        cv_.notify_all();
+        if (senderThread_.joinable()) {
+            senderThread_.join();
+        }
     }
 
 private:
-    static constexpr std::size_t kPacketsPerBuffer = UdpSender::kPacketsPerDatagram;
+    void SendLoop()
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point nextSend = Clock::now();
+        bool started = false;
+
+        for (;;) {
+            std::vector<std::uint8_t> frame;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this]() { return stopped_ || !queue_.empty(); });
+                if (stopped_) {
+                    return;
+                }
+                frame = std::move(queue_.front());
+                queue_.pop_front();
+            }
+
+            const auto now = Clock::now();
+            if (!started) {
+                started = true;
+                nextSend = now + jitterDelay_;
+            }
+            if (now < nextSend) {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait_until(lock, nextSend, [this]() { return stopped_; });
+                if (stopped_) {
+                    return;
+                }
+            }
+
+            const std::size_t packets = frame.size() / TsMuxer::kPacketSize;
+            for (std::size_t offset = 0; offset < packets; offset += UdpSender::kPacketsPerDatagram) {
+                const std::size_t batch = std::min(UdpSender::kPacketsPerDatagram, packets - offset);
+                if (!sender_.SendTsPackets(frame.data() + offset * TsMuxer::kPacketSize, batch) &&
+                    sendFailures_++ == 0) {
+                    OutputDebugStringW(L"wxr-vid-cap cast: a UDP send failed; continuing to send.\n");
+                }
+            }
+
+            nextSend += frameDuration_;
+            const auto after = Clock::now();
+            if (nextSend < after - frameDuration_ * 2) {
+                nextSend = after;  // Do not burst after a long stall.
+            }
+        }
+    }
 
     UdpSender& sender_;
-    std::array<unsigned char, UdpSender::kPacketSize * kPacketsPerBuffer> buffer_{};
-    std::size_t buffered_ = 0;
+    const int jitterFrames_;
+    const std::size_t maxFrames_;
+    const std::chrono::microseconds frameDuration_;
+    const std::chrono::microseconds jitterDelay_;
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::vector<std::uint8_t>> queue_;
+    std::vector<std::uint8_t> current_;
+    bool stopped_ = false;
     int sendFailures_ = 0;
+    std::thread senderThread_;
 };
 
 }  // namespace
@@ -154,6 +252,7 @@ struct Recorder::Impl {
     std::wstring targetExecutable;
     std::wstring backend;
     int hookTimeoutMs = 6000;
+    int retryTimeoutMs = 0;
     std::mutex sourceMutex;
     std::wstring currentSource;
     std::thread thread;
@@ -173,7 +272,7 @@ Recorder::~Recorder()
 }
 
 bool Recorder::Start(const std::wstring& path, const std::wstring& targetExecutable, std::wstring& error,
-                     int hookTimeoutMs)
+                     int hookTimeoutMs, int retryTimeoutMs)
 {
     if (impl_ && impl_->active.load()) {
         error = L"A recording is already running.";
@@ -184,6 +283,7 @@ bool Recorder::Start(const std::wstring& path, const std::wstring& targetExecuta
     impl_->path = path;
     impl_->targetExecutable = targetExecutable;
     impl_->hookTimeoutMs = hookTimeoutMs;
+    impl_->retryTimeoutMs = retryTimeoutMs;
     impl_->currentSource = targetExecutable;
 
     using Result = std::pair<bool, std::wstring>;
@@ -294,7 +394,7 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         }
     }
 
-    if (!hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, initError, hookTimeoutMs)) {
+    if (!hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, initError, hookTimeoutMs, retryTimeoutMs)) {
         logLine("error: " + Narrow(initError));
         fail(L"Could not start the graphics hook: " + initError);
         return;
@@ -467,14 +567,48 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
             audioMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audioStart).count();
         }
 
-        if (hookActive && !targetExecutable.empty() && frameIndex > 0 &&
-            frameIndex % kCaptureFps == 0 && hookEmptyFrames > 0) {
-            if (TargetStillPresent(targetExecutable, hook.ProcessId())) {
-                targetMissingChecks = 0;
-            } else if (++targetMissingChecks >= 3) {
-                if (!switchSource(TopMostWindowExecutable())) {
-                    break;
+        if (!targetExecutable.empty() && frameIndex > 0 && frameIndex % kCaptureFps == 0 &&
+            (!hookActive || hookEmptyFrames > 0)) {
+            const bool targetOpen = FindProcessByExecutable(targetExecutable) != 0;
+            if (!targetOpen) {
+                // The selected app is gone; the existing fallback may look for a replacement.
+                if (++targetMissingChecks >= 3) {
+                    if (!switchSource(TopMostWindowExecutable())) {
+                        break;
+                    }
                 }
+            } else if (!hookActive || !TargetStillPresent(targetExecutable, hook.ProcessId()) ||
+                       hookEmptyFrames >= kCaptureFps * 5) {
+                // The selected app is still running. Re-hook that same app instead of switching to
+                // whatever happens to be in front; top-most resolution is unreliable in Winlator.
+                if (++targetMissingChecks >= 3) {
+                    targetMissingChecks = 0;
+                    logLine("source: target still open; re-hooking the same application");
+                    hook.Stop();
+                    hookActive = false;
+                    std::wstring retryError;
+                    if (hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, retryError, 3000, 0)) {
+                        hookActive = true;
+                        hookEmptyFrames = 0;
+                        backend = L"graphics hook";
+                        {
+                            std::lock_guard<std::mutex> lock(sourceMutex);
+                            currentSource = targetExecutable;
+                        }
+                        std::wstring encoderError;
+                        if (!encoder.Initialize(kCaptureWidth, kCaptureHeight, kCaptureFps, kVideoBitrateKbps,
+                                                encoderError)) {
+                            error = L"Could not restart the video encoder after re-hooking the target: " +
+                                    encoderError;
+                            break;
+                        }
+                        logLine("source: re-hooked the same application");
+                    } else {
+                        logLine("source: same-app re-hook failed; will retry: " + Narrow(retryError));
+                    }
+                }
+            } else {
+                targetMissingChecks = 0;
             }
         } else if (hookEmptyFrames == 0) {
             targetMissingChecks = 0;
@@ -593,6 +727,8 @@ struct Caster::Impl {
     std::wstring targetExecutable;
     std::wstring backend;
     int hookTimeoutMs = 6000;
+    int jitterFrames = 8;
+    int retryTimeoutMs = 0;
     std::wstring currentSource;
     std::thread thread;
     std::atomic<bool> stopRequested{false};
@@ -613,7 +749,7 @@ Caster::~Caster()
 }
 
 bool Caster::Start(const std::wstring& host, unsigned short port, const std::wstring& targetExecutable,
-                   std::wstring& error, int hookTimeoutMs)
+                   std::wstring& error, int hookTimeoutMs, int jitterFrames, int retryTimeoutMs)
 {
     if (impl_ && impl_->active.load()) {
         error = L"A cast is already running.";
@@ -627,6 +763,8 @@ bool Caster::Start(const std::wstring& host, unsigned short port, const std::wst
     impl->port = port;
     impl->targetExecutable = targetExecutable;
     impl->hookTimeoutMs = hookTimeoutMs;
+    impl->jitterFrames = jitterFrames;
+    impl->retryTimeoutMs = retryTimeoutMs;
     impl->currentSource = targetExecutable;
 
     if (!impl->sender.Open(host, port, error)) {
@@ -765,7 +903,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         currentSource.clear();
     }
 
-    auto tryHookSource = [&](const std::wstring& candidate, int timeoutMs) -> bool {
+    auto tryHookSource = [&](const std::wstring& candidate, int timeoutMs, int lateRetryMs) -> bool {
         if (candidate.empty() || IsExcludedExecutablePath(candidate)) {
             return false;
         }
@@ -779,7 +917,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         }
 
         std::wstring switchError;
-        if (!hook->Start(candidate, kCaptureWidth, kCaptureHeight, switchError, timeoutMs)) {
+        if (!hook->Start(candidate, kCaptureWidth, kCaptureHeight, switchError, timeoutMs, lateRetryMs)) {
             trace(L"source: hook failed for " + candidate + L": " + switchError);
             return false;
         }
@@ -809,7 +947,8 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         hookActive = false;
         hookEmptyFrames = 0;
         targetMissingChecks = 0;
-        desiredTarget.clear();
+        // Keep desiredTarget: a selected app is retried for as long as the cast runs, even if its
+        // process is temporarily gone. Only an explicit source change replaces it.
         resetEncoder = true;
         nextRetry = GetTickCount64();
         frame.clear();
@@ -859,16 +998,21 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         });
     };
 
-    // Start with the requested source, then fall back to the current top-most window.
-    if (!desiredTarget.empty()) {
-        if (!tryHookSource(desiredTarget, hookTimeoutMs)) {
-            desiredTarget.clear();
+    // Start with the requested source. A selected app stays selected: it is retried until it can
+    // be hooked, without guessing another window. Top-most is only resolved when that was the
+    // user's choice.
+    const bool explicitTarget = !desiredTarget.empty();
+    if (explicitTarget) {
+        if (!tryHookSource(desiredTarget, hookTimeoutMs, retryTimeoutMs)) {
+            trace(L"source: selected target cannot be hooked yet; keeping it and retrying");
         }
     }
-    if (!hookActive) {
+    if (!hookActive && !explicitTarget) {
         const std::wstring top = TopMostWindowExecutable();
-        if (!top.empty()) {
-            tryHookSource(top, kHookRetryTimeoutMs);
+        if (!top.empty() && tryHookSource(top, kHookRetryTimeoutMs, 0)) {
+            // Pin the initial top-most pick. Re-resolving every retry can silently drift to a
+            // different window in Wine/Winlator, so keep retrying the app that was actually hooked.
+            desiredTarget = top;
         }
     }
     if (!hookActive) {
@@ -903,7 +1047,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         return;
     }
 
-    UdpTsSink sink(sender);
+    FrameQueueSink sink(sender, jitterFrames);
     TsMuxer muxer(sink, TsAudioCodec::Opus, audioChannels);
 
     active = true;
@@ -984,6 +1128,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     };
 
     while (!stopRequested.load()) {
+        sink.BeginFrame();
         const std::int64_t pts = static_cast<std::int64_t>(frameIndex) * frameTicks;
 
         if (frameIndex > 0) {
@@ -1086,8 +1231,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
                     newHook.reset();
                 }
                 if (!desiredTarget.empty()) {
-                    trace(L"source: selected target unavailable; falling back to top-most retries");
-                    desiredTarget.clear();
+                    trace(L"source: selected target is still not hookable; retrying it");
                 }
                 nextRetry = GetTickCount64() + kSourceRetryIntervalMs;
             }
@@ -1161,6 +1305,11 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
             }
         }
 
+        if (sink.EndFrame()) {
+            resetEncoder = true;
+            trace(L"cast: jitter buffer overflow; forcing a keyframe");
+        }
+
         ++frameIndex;
         const auto deadline =
             start + std::chrono::microseconds(static_cast<long long>(frameIndex) * 1000000 / kCaptureFps);
@@ -1180,7 +1329,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         pendingHook->Stop();
         pendingHook.reset();
     }
-    sink.Flush();
+    sink.Stop();
 
     trace(L"stopped after " + std::to_wstring(framesSent) + L" frames");
     if (!error.empty()) {

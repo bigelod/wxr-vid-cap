@@ -49,21 +49,30 @@ with the hook. It ships with `taskmgr.exe`, `explorer.exe`, `notepad.exe`, and W
 `wfm.exe`; edit it and restart the app to change the list. Blacklisted apps are also removed from
 the running-applications list.
 
-Capture, encoding, and audio work for both local recording and LAN casting. `RECORD LOCAL` writes an
-H.264 + Opus MKV at 1280×720, 24 fps, 4 Mbps video, 96 kbps audio. With a target selected it captures
-inside the process through the graphics API — D3D9 `EndScene`, D3D10/D3D11 `Present`, D3D12
-`Present` with a launch-time device capture, OpenGL `SwapBuffers`, and Vulkan `vkQueuePresentKHR`.
-That is the only way to see DXVK surfaces. D3D12 and Vulkan targets should use the launch option;
-other targets can be injected while running. There is no GDI fallback: if the hook cannot start,
-recording fails with the hook error. While recording, the tray tooltip shows elapsed time and the
-recording stops automatically at 15 minutes.
+Capture, encoding, and audio work for both local recording and LAN casting. `RECORD LOCAL` opens a
+Save dialog prefilled with `D:\WXRVIDCAP\capture_YYYY-MM-DD_hh_mm_ss.mkv` (the directory is created
+when missing) and writes an H.264 + Opus MKV at 1280×720, 24 fps, 4 Mbps video, 96 kbps audio. With a
+target selected it captures inside the process through the graphics API — DirectDraw
+`Blt`/`BltFast`/`Flip`, D3D9 `EndScene`, D3D10/D3D11 `Present`, D3D12 `Present` with a launch-time
+device capture, OpenGL `SwapBuffers`, and Vulkan `vkQueuePresentKHR`. That is the only way to see
+DXVK surfaces. D3D12 and Vulkan targets should use the launch option; other targets can be injected
+while running. There is no GDI fallback: if the hook cannot start, recording fails with the hook
+error. While recording, the tray tooltip shows elapsed time and the recording stops automatically at
+15 minutes.
 
 `CAST LOCAL` runs the same capture and encode path but muxes H.264 and Opus into MPEG-TS and sends
 it over UDP to the receiver IP. It writes no file and does not wait for a receiver
-acknowledgement: VLC can open `udp://@:<port>` before or after the cast starts. The IP prompt is
-prefilled with the last address used (port 1234 by default); use a VLC network cache of 200–300 ms
-for low latency. If no source can be hooked, the cast continues with black video and silent audio
-while a background probe retries the top-most window.
+acknowledgement: VLC can open `udp://@:<port>` before or after the cast starts. The IP dialog has a
+touch keypad (`7 8 9 / 4 5 6 / 1 2 3 / 0 . BSP`); a blank address starts at `192.168.0.`, and the
+last address used is prefilled next time (port 1234 by default). Use a VLC network cache of
+200–300 ms; the caster also buffers 8 frames (`[cast] jitter_frames`, 0 disables) before paced
+sending, which smooths playback at the cost of about a third of a second of extra latency. If no
+source can be hooked, the cast continues with black video and silent audio while a background probe
+keeps retrying. An application chosen in the source screen stays selected: while its process is
+open, the caster keeps retrying that same app instead of switching to another window, and the
+default top-most pick is pinned once it is hooked. Use `SELECT CAST SOURCE...` to choose a
+different app. A launch-through-hook cast waits 30 s for the first frame, then 30 s more after
+asking the resident hook to re-scan its loaded modules.
 
 Start and stop play short two-beep cues (low→medium on start, high→medium on stop), and a third low
 "dun dun" cue plays when a manual record/cast start or launch cannot hook. Run
@@ -83,6 +92,7 @@ Only x64 is configured for the app; Winlator runs x64 binaries under Box64.
 
 | App | API |
 | --- | --- |
+| `cube_ddraw.exe` | DirectDraw 2D (windowed `Blt`, `--fullscreen` for `Flip`) |
 | `cube_d3d7.exe` | Direct3D 7 (DirectDraw 7 + D3D7 immediate mode) |
 | `cube_d3d8.exe` | Direct3D 8 |
 | `cube_d3d9.exe` | Direct3D 9 |
@@ -93,19 +103,20 @@ Only x64 is configured for the app; Winlator runs x64 binaries under Box64.
 | `cube_vk.exe` | Vulkan |
 
 Each opens an 800×450 window with a spinning cube whose six faces get random colors, plays a
-looping bytebeat tone, and shows the live frame rate in the title bar. Pick one in the capture
-source list, then use `RECORD LOCAL` or `CAST LOCAL`.
+looping bytebeat tone, and shows the live frame rate in the title bar. `cube_ddraw` instead shows a
+rotating 2D rectangle with a `DDRAW` label, using only DirectDraw. Pick one in the capture source
+list, then use `RECORD LOCAL` or `CAST LOCAL`.
 
-`build.ps1` builds all eight into `build\testapps\Release`. Each app writes `testapp.log` beside
+`build.ps1` builds all of them into `build\testapps\Release`. Each app writes `testapp.log` beside
 itself with the API setup result and audio status, which is useful when a container lacks a runtime.
 
 Notes:
 
-- The capture hook handles D3D7 (DirectDraw `Blt`), D3D8, D3D9, D3D10, D3D11, D3D12, OpenGL, and
-  Vulkan. D3D12 and Vulkan need launch-time injection (`wxr_launch.exe` / `wxr_launch32.exe`), which
-  the capture source screen's `Start and inject capture into an application` option uses. The
-  container's d3d8 is 32-bit (the D3D8 games are 32-bit), so `cube_d3d8.exe` is built for Win32 and
-  the x64 host injects the 32-bit hook.
+- The capture hook handles DirectDraw (`Blt`, `BltFast`, `Flip`, legacy and 7 interfaces), D3D7,
+  D3D8, D3D9, D3D10, D3D11, D3D12, OpenGL, and Vulkan. D3D12 and Vulkan need launch-time injection
+  (`wxr_launch.exe` / `wxr_launch32.exe`), which the capture source screen's `Start and inject
+  capture into an application` option uses. The container's d3d8 is 32-bit (the D3D8 games are
+  32-bit), so `cube_d3d8.exe` is built for Win32 and the x64 host injects the 32-bit hook.
 - Every app accepts `--fullscreen`, which creates a borderless window at the desktop resolution.
   `cube_runner` runs the whole set windowed and fullscreen, in both 64-bit and 32-bit builds
   (`<app>.exe` and `<app>32.exe`). Vulkan is 64-bit only here.

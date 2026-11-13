@@ -47,6 +47,15 @@ EndSceneFn g_originalEndScene = nullptr;
 std::ofstream g_log;
 std::mutex g_logMutex;
 
+using Create9Fn = IDirect3D9*(WINAPI*)(UINT);
+using Create9ExFn = HRESULT(WINAPI*)(UINT, IDirect3D9Ex**);
+using CreateDevice9Fn = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD,
+                                                    D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+Create9Fn g_originalCreate9 = nullptr;
+Create9ExFn g_originalCreate9Ex = nullptr;
+CreateDevice9Fn g_originalCreateDevice9 = nullptr;
+std::mutex g_d3d9HookMutex;
+
 IDXGISwapChain* g_swapChain = nullptr;
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
@@ -71,13 +80,32 @@ UINT g_d3d9Height = 0;
 D3DFORMAT g_d3d9Format = D3DFMT_UNKNOWN;
 int g_d3d9FrameCount = 0;
 
-// Direct3D 7 / DirectDraw: the app blits its back buffer to the primary surface, so hook Blt and
-// read the source surface before the blit.
+// DirectDraw: blits, fast blits, and flips all end with a drawable surface. Surfaces are read after
+// Blt/BltFast and before Flip, so the captured image is whatever the app just composed. Every
+// interface version has its own vtable entries, so each distinct function address gets its own
+// slot and trampoline (CNC-Ddraw and legacy DDraw apps do not all share IDirectDrawSurface7's
+// implementation).
+constexpr int kMaxDdrawHookSlots = 6;
+constexpr int kDdrawBltVtableIndex = 5;
+constexpr int kDdrawBltFastVtableIndex = 7;
+constexpr int kDdrawFlipVtableIndex = 11;
+constexpr int kDdrawUnlockVtableIndex = 32;
+constexpr int kDdrawMinWidth = 160;
+constexpr int kDdrawMinHeight = 120;
+
 using DdrawBltFn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface7*, LPRECT, IDirectDrawSurface7*, LPRECT, DWORD,
                                                LPDDBLTFX);
-DdrawBltFn g_originalDdrawBlt = nullptr;
-int g_d3d7FrameCount = 0;
+using DdrawBltFastFn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface7*, DWORD, DWORD, IDirectDrawSurface7*, LPRECT,
+                                                   DWORD);
+using DdrawFlipFn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface7*, IDirectDrawSurface7*, DWORD);
+using DdrawUnlockFn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface7*, LPRECT);
 
+DdrawBltFn g_originalDdrawBlt[kMaxDdrawHookSlots] = {};
+DdrawBltFastFn g_originalDdrawBltFast[kMaxDdrawHookSlots] = {};
+DdrawFlipFn g_originalDdrawFlip[kMaxDdrawHookSlots] = {};
+std::vector<void*> g_ddrawHookedAddresses;
+thread_local bool g_inDdrawCapture = false;
+int g_ddrawFrameCount = 0;
 // Direct3D 10: the swapchain is the same DXGI object, but the backbuffer must be read through the
 // D3D10 device (the D3D11 staging path returns black for a D3D10 swapchain).
 IDXGISwapChain* g_d3d10SwapChain = nullptr;
@@ -499,10 +527,140 @@ void CaptureD3D9(IDirect3DDevice9* device)
     }
 }
 
+// IDirect3D9::CreateDevice is vtable slot 16 (IUnknown 0-2, then 13 methods before CreateDevice:
+// RegisterSoftwareDevice through CheckDeviceFormatConversion, GetDeviceCaps, GetAdapterMonitor).
+constexpr int kCreateDeviceVtableIndex = 16;
+
 HRESULT WINAPI EndSceneDetour(IDirect3DDevice9* device)
 {
     CaptureD3D9(device);
     return g_originalEndScene != nullptr ? g_originalEndScene(device) : D3DERR_INVALIDCALL;
+}
+
+void HookD3D9Device(IDirect3DDevice9* device)
+{
+    if (device == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_d3d9HookMutex);
+    if (g_originalEndScene != nullptr) {
+        return;
+    }
+
+    void** vtable = *reinterpret_cast<void***>(device);
+    void* endScene = vtable[kEndSceneVtableIndex];
+    if (endScene == nullptr) {
+        return;
+    }
+
+    if (MH_CreateHook(endScene, reinterpret_cast<LPVOID>(&EndSceneDetour),
+                      reinterpret_cast<LPVOID*>(&g_originalEndScene)) != MH_OK) {
+        Log("d3d9 direct EndScene hook creation failed");
+        return;
+    }
+    if (MH_EnableHook(endScene) == MH_OK) {
+        Log("d3d9 direct EndScene hooked");
+    }
+}
+
+HRESULT STDMETHODCALLTYPE CreateDevice9Detour(IDirect3D9* self, UINT adapter, D3DDEVTYPE deviceType,
+                                              HWND focusWindow, DWORD behaviorFlags,
+                                              D3DPRESENT_PARAMETERS* parameters,
+                                              IDirect3DDevice9** device)
+{
+    const HRESULT result =
+        g_originalCreateDevice9 != nullptr
+            ? g_originalCreateDevice9(self, adapter, deviceType, focusWindow, behaviorFlags, parameters, device)
+            : D3DERR_INVALIDCALL;
+    if (SUCCEEDED(result) && device != nullptr && *device != nullptr) {
+        HookD3D9Device(*device);
+    }
+    return result;
+}
+
+void HookD3D9CreateDevice(IDirect3D9* d3d9)
+{
+    if (d3d9 == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_d3d9HookMutex);
+    if (g_originalCreateDevice9 != nullptr) {
+        return;
+    }
+
+    void** vtable = *reinterpret_cast<void***>(d3d9);
+    void* createDevice = vtable[kCreateDeviceVtableIndex];
+    if (createDevice == nullptr) {
+        return;
+    }
+
+    if (MH_CreateHook(createDevice, reinterpret_cast<LPVOID>(&CreateDevice9Detour),
+                      reinterpret_cast<LPVOID*>(&g_originalCreateDevice9)) != MH_OK) {
+        Log("d3d9 CreateDevice hook creation failed");
+        return;
+    }
+    if (MH_EnableHook(createDevice) == MH_OK) {
+        Log("d3d9 CreateDevice hooked");
+    }
+}
+
+IDirect3D9* WINAPI Create9Detour(UINT sdkVersion)
+{
+    IDirect3D9* d3d9 = g_originalCreate9 != nullptr ? g_originalCreate9(sdkVersion) : nullptr;
+    if (d3d9 != nullptr) {
+        HookD3D9CreateDevice(d3d9);
+    }
+    return d3d9;
+}
+
+HRESULT WINAPI Create9ExDetour(UINT sdkVersion, IDirect3D9Ex** d3d9)
+{
+    const HRESULT result =
+        g_originalCreate9Ex != nullptr ? g_originalCreate9Ex(sdkVersion, d3d9) : E_FAIL;
+    if (SUCCEEDED(result) && d3d9 != nullptr && *d3d9 != nullptr) {
+        HookD3D9CreateDevice(*d3d9);
+    }
+    return result;
+}
+
+bool InstallD3D9CreateHooks()
+{
+    std::lock_guard<std::mutex> lock(g_d3d9HookMutex);
+    HMODULE d3d9 = GetModuleHandleW(L"d3d9.dll");
+    if (d3d9 == nullptr) {
+        return false;
+    }
+
+    bool any = false;
+    if (g_originalCreate9 == nullptr) {
+        auto create9 = GetProcAddress(d3d9, "Direct3DCreate9");
+        if (create9 != nullptr &&
+            MH_CreateHook(create9, reinterpret_cast<LPVOID>(&Create9Detour),
+                          reinterpret_cast<LPVOID*>(&g_originalCreate9)) == MH_OK) {
+            MH_EnableHook(create9);
+            Log("d3d9 Direct3DCreate9 hooked");
+            any = true;
+        }
+    } else {
+        any = true;
+    }
+
+    if (g_originalCreate9Ex == nullptr) {
+        auto create9Ex = GetProcAddress(d3d9, "Direct3DCreate9Ex");
+        if (create9Ex != nullptr &&
+            MH_CreateHook(create9Ex, reinterpret_cast<LPVOID>(&Create9ExDetour),
+                          reinterpret_cast<LPVOID*>(&g_originalCreate9Ex)) == MH_OK) {
+            MH_EnableHook(create9Ex);
+            Log("d3d9 Direct3DCreate9Ex hooked");
+            any = true;
+        }
+    } else {
+        any = true;
+    }
+
+    return any;
 }
 
 void ReleaseStaging()
@@ -1515,67 +1673,316 @@ void SignalReady()
     }
 }
 
+bool QueryDdrawDescription(IDirectDrawSurface7* surface, DDSURFACEDESC2& description)
+{
+    description = {};
+    description.dwSize = sizeof(description);
+    if (SUCCEEDED(surface->GetSurfaceDesc(&description))) {
+        return true;
+    }
+
+    // Legacy IDirectDrawSurface (v1) implementations reject the v2 structure size. The relevant
+    // fields sit at the same offsets in DDSURFACEDESC, so retry with the older size.
+    DDSURFACEDESC legacy = {};
+    legacy.dwSize = sizeof(legacy);
+    using GetSurfaceDesc1Fn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface*, LPDDSURFACEDESC);
+    void** vtable = *reinterpret_cast<void***>(surface);
+    auto getSurfaceDesc = reinterpret_cast<GetSurfaceDesc1Fn>(vtable[22]);
+    if (FAILED(getSurfaceDesc(reinterpret_cast<IDirectDrawSurface*>(surface), &legacy))) {
+        return false;
+    }
+
+    description.dwFlags = legacy.dwFlags;
+    description.dwHeight = legacy.dwHeight;
+    description.dwWidth = legacy.dwWidth;
+    description.lPitch = legacy.lPitch;
+    description.ddpfPixelFormat = legacy.ddpfPixelFormat;
+    return true;
+}
+
+bool LockDdrawSurface(IDirectDrawSurface7* surface, DDSURFACEDESC2& locked)
+{
+    locked = {};
+    locked.dwSize = sizeof(locked);
+    if (SUCCEEDED(surface->Lock(nullptr, &locked, DDLOCK_READONLY | DDLOCK_WAIT, nullptr))) {
+        return true;
+    }
+
+    DDSURFACEDESC legacy = {};
+    legacy.dwSize = sizeof(legacy);
+    using Lock1Fn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface*, LPRECT, LPDDSURFACEDESC, DWORD, HANDLE);
+    void** vtable = *reinterpret_cast<void***>(surface);
+    auto lock = reinterpret_cast<Lock1Fn>(vtable[25]);
+    if (SUCCEEDED(lock(reinterpret_cast<IDirectDrawSurface*>(surface), nullptr, &legacy,
+                       DDLOCK_READONLY | DDLOCK_WAIT, nullptr))) {
+        locked.dwFlags = legacy.dwFlags;
+        locked.dwHeight = legacy.dwHeight;
+        locked.dwWidth = legacy.dwWidth;
+        locked.lPitch = legacy.lPitch;
+        locked.lpSurface = legacy.lpSurface;
+        locked.ddpfPixelFormat = legacy.ddpfPixelFormat;
+        return true;
+    }
+
+    // Some old drivers ignore READONLY. Retry without it before giving up.
+    locked = {};
+    locked.dwSize = sizeof(locked);
+    if (SUCCEEDED(surface->Lock(nullptr, &locked, DDLOCK_WAIT, nullptr))) {
+        return true;
+    }
+
+    locked = {};
+    locked.dwSize = sizeof(legacy);
+    if (SUCCEEDED(lock(reinterpret_cast<IDirectDrawSurface*>(surface), nullptr,
+                       reinterpret_cast<LPDDSURFACEDESC>(&locked), DDLOCK_WAIT, nullptr))) {
+        return locked.lpSurface != nullptr;
+    }
+    return false;
+}
+
+void UnlockDdrawSurface(IDirectDrawSurface7* surface)
+{
+    // Call the vtable entry directly so a future Unlock detour cannot re-enter this function.
+    using Unlock1Fn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface*, LPRECT);
+    void** vtable = *reinterpret_cast<void***>(surface);
+    auto unlock = reinterpret_cast<Unlock1Fn>(vtable[kDdrawUnlockVtableIndex]);
+    unlock(reinterpret_cast<IDirectDrawSurface*>(surface), nullptr);
+}
+
+std::uint8_t ExpandDdrawChannel(std::uint32_t pixel, std::uint32_t mask)
+{
+    if (mask == 0) {
+        return 0;
+    }
+    int shift = 0;
+    while ((mask & 1u) == 0) {
+        mask >>= 1;
+        ++shift;
+    }
+    const std::uint32_t value = (pixel >> shift) & mask;
+    return static_cast<std::uint8_t>((value * 255u + mask / 2u) / mask);
+}
+
+// Reads one surface and publishes it as BGRA. Handles the 32-bit primary/backbuffer surfaces most
+// DirectDraw apps use, plus the 16-bit RGB565/RGB555 surfaces older games and CNC-Ddraw request.
 void CaptureDdrawSurface(IDirectDrawSurface7* surface)
 {
-    DDSURFACEDESC2 description = {};
-    description.dwSize = sizeof(description);
-    if (FAILED(surface->GetSurfaceDesc(&description))) {
+    if (surface == nullptr || g_inDdrawCapture) {
         return;
     }
-    if (description.dwWidth == 0 || description.dwHeight == 0 ||
+    if (!EnsureWriter()) {
+        return;
+    }
+
+    g_inDdrawCapture = true;
+
+    DDSURFACEDESC2 description = {};
+    if (!QueryDdrawDescription(surface, description) || description.dwWidth < static_cast<DWORD>(kDdrawMinWidth) ||
+        description.dwHeight < static_cast<DWORD>(kDdrawMinHeight) ||
         description.dwWidth > static_cast<DWORD>(kSharedMaxWidth) ||
         description.dwHeight > static_cast<DWORD>(kSharedMaxHeight)) {
+        g_inDdrawCapture = false;
         return;
     }
-    if (description.ddpfPixelFormat.dwRGBBitCount != 32) {
+
+    const DWORD bits = description.ddpfPixelFormat.dwRGBBitCount;
+    if (bits != 32 && bits != 16) {
+        g_inDdrawCapture = false;
         return;
     }
 
     DDSURFACEDESC2 locked = {};
-    locked.dwSize = sizeof(locked);
-    if (FAILED(surface->Lock(nullptr, &locked, DDLOCK_READONLY | DDLOCK_WAIT, nullptr))) {
+    if (!LockDdrawSurface(surface, locked) || locked.lpSurface == nullptr) {
+        g_inDdrawCapture = false;
         return;
     }
 
-    g_writer.Write(static_cast<const std::uint8_t*>(locked.lpSurface), static_cast<int>(description.dwWidth),
-                   static_cast<int>(description.dwHeight), static_cast<int>(locked.lPitch),
-                   static_cast<std::int64_t>(GetTickCount64()));
-    surface->Unlock(nullptr);
+    const int width = static_cast<int>(description.dwWidth);
+    const int height = static_cast<int>(description.dwHeight);
+    const auto* base = static_cast<const std::uint8_t*>(locked.lpSurface);
+    const int pitch = static_cast<int>(locked.lPitch);
 
-    ++g_d3d7FrameCount;
-    if (g_d3d7FrameCount == 1 || (g_d3d7FrameCount % 120) == 0) {
-        Log("d3d7 frame " + std::to_string(g_d3d7FrameCount) + ": " + std::to_string(description.dwWidth) + "x" +
-            std::to_string(description.dwHeight));
+    if (bits == 32) {
+        g_writer.Write(base, width, height, pitch, static_cast<std::int64_t>(GetTickCount64()));
+    } else {
+        static thread_local std::vector<std::uint8_t> converted;
+        converted.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+        const std::uint32_t redMask = description.ddpfPixelFormat.dwRBitMask;
+        const std::uint32_t greenMask = description.ddpfPixelFormat.dwGBitMask;
+        const std::uint32_t blueMask = description.ddpfPixelFormat.dwBBitMask;
+        for (int y = 0; y < height; ++y) {
+            const auto* sourceRow = reinterpret_cast<const std::uint16_t*>(base + static_cast<std::size_t>(y) * pitch);
+            std::uint8_t* destinationRow = converted.data() + static_cast<std::size_t>(y) *
+                                                               static_cast<std::size_t>(width) * 4;
+            for (int x = 0; x < width; ++x) {
+                const std::uint16_t pixel = sourceRow[x];
+                destinationRow[x * 4 + 0] = ExpandDdrawChannel(pixel, blueMask);
+                destinationRow[x * 4 + 1] = ExpandDdrawChannel(pixel, greenMask);
+                destinationRow[x * 4 + 2] = ExpandDdrawChannel(pixel, redMask);
+                destinationRow[x * 4 + 3] = 255;
+            }
+        }
+        g_writer.Write(converted.data(), width, height, width * 4, static_cast<std::int64_t>(GetTickCount64()));
+    }
+
+    UnlockDdrawSurface(surface);
+    g_inDdrawCapture = false;
+
+    ++g_ddrawFrameCount;
+    if (g_ddrawFrameCount == 1 || (g_ddrawFrameCount % 120) == 0) {
+        Log("ddraw frame " + std::to_string(g_ddrawFrameCount) + ": " + std::to_string(width) + "x" +
+            std::to_string(height) + " " + std::to_string(bits) + "bpp");
     }
 }
 
+// Primary surfaces are desktop-sized in windowed mode, so a Blt's destination only has the app's
+// rectangle composited into a much larger desktop image. Prefer the source back buffer in that case.
+// Blits into an offscreen back buffer are captured at the destination instead, which accumulates
+// sprite-by-sprite rendering.
+void CaptureDdrawResult(IDirectDrawSurface7* destination, IDirectDrawSurface7* source)
+{
+    bool destinationIsPrimary = false;
+    if (destination != nullptr) {
+        DDSCAPS2 caps = {};
+        if (SUCCEEDED(destination->GetCaps(&caps))) {
+            destinationIsPrimary = (caps.dwCaps & DDSCAPS_PRIMARYSURFACE) != 0;
+        }
+    }
+
+    DDSURFACEDESC2 description = {};
+    const bool destinationEligible =
+        destination != nullptr && QueryDdrawDescription(destination, description) &&
+        description.dwWidth >= static_cast<DWORD>(kDdrawMinWidth) &&
+        description.dwHeight >= static_cast<DWORD>(kDdrawMinHeight);
+    const bool sourceEligible = source != nullptr && QueryDdrawDescription(source, description) &&
+                                description.dwWidth >= static_cast<DWORD>(kDdrawMinWidth) &&
+                                description.dwHeight >= static_cast<DWORD>(kDdrawMinHeight);
+
+    if (destinationIsPrimary && sourceEligible) {
+        CaptureDdrawSurface(source);
+    } else if (destinationEligible) {
+        CaptureDdrawSurface(destination);
+    } else if (sourceEligible) {
+        CaptureDdrawSurface(source);
+    }
+}
+
+template <int Slot>
 HRESULT STDMETHODCALLTYPE DdrawBltDetour(IDirectDrawSurface7* destination, LPRECT destinationRect,
                                          IDirectDrawSurface7* source, LPRECT sourceRect, DWORD flags,
                                          LPDDBLTFX effects)
 {
-    if (source != nullptr && EnsureWriter() && ShouldCapture()) {
-        CaptureDdrawSurface(source);
+    const HRESULT result =
+        g_originalDdrawBlt[Slot] != nullptr
+            ? g_originalDdrawBlt[Slot](destination, destinationRect, source, sourceRect, flags, effects)
+            : DDERR_GENERIC;
+    if (SUCCEEDED(result) && EnsureWriter() && ShouldCapture()) {
+        CaptureDdrawResult(destination, source);
     }
-    return g_originalDdrawBlt != nullptr
-               ? g_originalDdrawBlt(destination, destinationRect, source, sourceRect, flags, effects)
-               : DDERR_GENERIC;
+    return result;
 }
 
-void* FindDdrawBltAddress()
+template <int Slot>
+HRESULT STDMETHODCALLTYPE DdrawBltFastDetour(IDirectDrawSurface7* destination, DWORD x, DWORD y,
+                                             IDirectDrawSurface7* source, LPRECT sourceRect, DWORD flags)
+{
+    const HRESULT result = g_originalDdrawBltFast[Slot] != nullptr
+                               ? g_originalDdrawBltFast[Slot](destination, x, y, source, sourceRect, flags)
+                               : DDERR_GENERIC;
+    if (SUCCEEDED(result) && EnsureWriter() && ShouldCapture()) {
+        CaptureDdrawResult(destination, source);
+    }
+    return result;
+}
+
+template <int Slot>
+HRESULT STDMETHODCALLTYPE DdrawFlipDetour(IDirectDrawSurface7* surface, IDirectDrawSurface7* targetOverride,
+                                          DWORD flags)
+{
+    // Read the attached back buffer before the flip swaps it into the primary.
+    if (surface != nullptr && EnsureWriter() && ShouldCapture()) {
+        IDirectDrawSurface7* backBuffer = nullptr;
+        DDSCAPS2 caps = {};
+        caps.dwCaps = DDSCAPS_BACKBUFFER;
+        if (SUCCEEDED(surface->GetAttachedSurface(&caps, &backBuffer)) && backBuffer != nullptr) {
+            CaptureDdrawSurface(backBuffer);
+            backBuffer->Release();
+        }
+    }
+
+    const HRESULT result = g_originalDdrawFlip[Slot] != nullptr
+                               ? g_originalDdrawFlip[Slot](surface, targetOverride, flags)
+                               : DDERR_GENERIC;
+    if (SUCCEEDED(result) && surface != nullptr && EnsureWriter() && ShouldCapture()) {
+        CaptureDdrawSurface(surface);
+    }
+    return result;
+}
+
+using DdrawBltDetourFn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface7*, LPRECT, IDirectDrawSurface7*, LPRECT,
+                                                     DWORD, LPDDBLTFX);
+using DdrawBltFastDetourFn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface7*, DWORD, DWORD, IDirectDrawSurface7*,
+                                                         LPRECT, DWORD);
+using DdrawFlipDetourFn = HRESULT(STDMETHODCALLTYPE*)(IDirectDrawSurface7*, IDirectDrawSurface7*, DWORD);
+
+const DdrawBltDetourFn kBltDetours[kMaxDdrawHookSlots] = {
+    &DdrawBltDetour<0>, &DdrawBltDetour<1>, &DdrawBltDetour<2>,
+    &DdrawBltDetour<3>, &DdrawBltDetour<4>, &DdrawBltDetour<5>,
+};
+const DdrawBltFastDetourFn kBltFastDetours[kMaxDdrawHookSlots] = {
+    &DdrawBltFastDetour<0>, &DdrawBltFastDetour<1>, &DdrawBltFastDetour<2>,
+    &DdrawBltFastDetour<3>, &DdrawBltFastDetour<4>, &DdrawBltFastDetour<5>,
+};
+const DdrawFlipDetourFn kFlipDetours[kMaxDdrawHookSlots] = {
+    &DdrawFlipDetour<0>, &DdrawFlipDetour<1>, &DdrawFlipDetour<2>,
+    &DdrawFlipDetour<3>, &DdrawFlipDetour<4>, &DdrawFlipDetour<5>,
+};
+
+template <typename OriginalFn, typename DetourFn>
+bool HookDdrawAddress(void* address, OriginalFn* originals, const DetourFn* detours, const char* name)
+{
+    if (address == nullptr) {
+        return false;
+    }
+    for (void* hooked : g_ddrawHookedAddresses) {
+        if (hooked == address) {
+            return true;
+        }
+    }
+    int slot = 0;
+    while (slot < kMaxDdrawHookSlots && originals[slot] != nullptr) {
+        ++slot;
+    }
+    if (slot >= kMaxDdrawHookSlots) {
+        return false;
+    }
+    if (MH_CreateHook(address, reinterpret_cast<LPVOID>(detours[slot]),
+                      reinterpret_cast<LPVOID*>(&originals[slot])) != MH_OK) {
+        return false;
+    }
+    MH_EnableHook(address);
+    g_ddrawHookedAddresses.push_back(address);
+    Log(std::string("ddraw ") + name + " hooked at slot " + std::to_string(slot));
+    return true;
+}
+
+void AddDdrawSurfaceAddresses(IDirectDrawSurface7* surface, std::vector<void*>& blt, std::vector<void*>& bltFast,
+                              std::vector<void*>& flip)
+{
+    void** vtable = *reinterpret_cast<void***>(surface);
+    blt.push_back(vtable[kDdrawBltVtableIndex]);
+    bltFast.push_back(vtable[kDdrawBltFastVtableIndex]);
+    flip.push_back(vtable[kDdrawFlipVtableIndex]);
+}
+
+// Collects the Blt/BltFast/Flip addresses from both the legacy IDirectDraw and IDirectDraw7
+// surface implementations. CNC-Ddraw exposes its own ddraw.dll, so these are the functions its
+// surfaces will use too.
+void FindDdrawSurfaceAddresses(std::vector<void*>& blt, std::vector<void*>& bltFast, std::vector<void*>& flip)
 {
     HMODULE ddraw = GetModuleHandleW(L"ddraw.dll");
     if (ddraw == nullptr) {
-        return nullptr;
-    }
-    auto create = reinterpret_cast<HRESULT(WINAPI*)(GUID*, void**, REFIID, IUnknown*)>(
-        GetProcAddress(ddraw, "DirectDrawCreateEx"));
-    if (create == nullptr) {
-        return nullptr;
-    }
-
-    IDirectDraw7* directDraw = nullptr;
-    if (FAILED(create(nullptr, reinterpret_cast<void**>(&directDraw), IID_IDirectDraw7, nullptr))) {
-        return nullptr;
+        return;
     }
 
     const wchar_t className[] = L"WxrHookDummy7";
@@ -1587,49 +1994,91 @@ void* FindDdrawBltAddress()
     RegisterClassExW(&windowClass);
     HWND window = CreateWindowExW(0, className, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
                                   GetModuleHandleW(nullptr), nullptr);
-    if (window != nullptr) {
-        directDraw->SetCooperativeLevel(window, DDSCL_NORMAL);
+
+    // IDirectDraw7 surfaces.
+    auto createEx = reinterpret_cast<HRESULT(WINAPI*)(GUID*, void**, REFIID, IUnknown*)>(
+        GetProcAddress(ddraw, "DirectDrawCreateEx"));
+    if (createEx != nullptr) {
+        IDirectDraw7* directDraw = nullptr;
+        if (SUCCEEDED(createEx(nullptr, reinterpret_cast<void**>(&directDraw), IID_IDirectDraw7, nullptr)) &&
+            directDraw != nullptr) {
+            if (window != nullptr) {
+                directDraw->SetCooperativeLevel(window, DDSCL_NORMAL);
+            }
+            DDSURFACEDESC2 description = {};
+            description.dwSize = sizeof(description);
+            description.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT;
+            description.dwWidth = 4;
+            description.dwHeight = 4;
+            description.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN;
+            IDirectDrawSurface7* surface = nullptr;
+            if (SUCCEEDED(directDraw->CreateSurface(&description, &surface, nullptr)) && surface != nullptr) {
+                AddDdrawSurfaceAddresses(surface, blt, bltFast, flip);
+                surface->Release();
+            }
+            directDraw->Release();
+        }
     }
 
-    DDSURFACEDESC2 description = {};
-    description.dwSize = sizeof(description);
-    description.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT;
-    description.dwWidth = 4;
-    description.dwHeight = 4;
-    description.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN;
-
-    IDirectDrawSurface7* surface = nullptr;
-    void* blt = nullptr;
-    if (SUCCEEDED(directDraw->CreateSurface(&description, &surface, nullptr)) && surface != nullptr) {
-        blt = (*reinterpret_cast<void***>(surface))[5];
-        surface->Release();
+    // Legacy IDirectDraw surfaces (v1). Many CNC-Ddraw titles use these directly.
+    auto createLegacy = reinterpret_cast<HRESULT(WINAPI*)(GUID*, LPDIRECTDRAW*, IUnknown*)>(
+        GetProcAddress(ddraw, "DirectDrawCreate"));
+    if (createLegacy != nullptr) {
+        LPDIRECTDRAW directDraw = nullptr;
+        if (SUCCEEDED(createLegacy(nullptr, &directDraw, nullptr)) && directDraw != nullptr) {
+            if (window != nullptr) {
+                directDraw->SetCooperativeLevel(window, DDSCL_NORMAL);
+            }
+            DDSURFACEDESC description = {};
+            description.dwSize = sizeof(description);
+            description.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT;
+            description.dwWidth = 4;
+            description.dwHeight = 4;
+            description.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN;
+            LPDIRECTDRAWSURFACE surface = nullptr;
+            if (SUCCEEDED(directDraw->CreateSurface(&description, &surface, nullptr)) && surface != nullptr) {
+                AddDdrawSurfaceAddresses(reinterpret_cast<IDirectDrawSurface7*>(surface), blt, bltFast, flip);
+                surface->Release();
+            }
+            directDraw->Release();
+        }
     }
 
     if (window != nullptr) {
         DestroyWindow(window);
     }
     UnregisterClassW(className, GetModuleHandleW(nullptr));
-    directDraw->Release();
-    return blt;
 }
 
-bool InstallD3D7Hooks()
+bool InstallDdrawHooks()
 {
     if (GetModuleHandleW(L"ddraw.dll") == nullptr) {
         return false;
     }
-    if (g_originalDdrawBlt != nullptr) {
+    if (!g_ddrawHookedAddresses.empty()) {
         return true;
     }
-    void* blt = FindDdrawBltAddress();
-    if (blt == nullptr) {
-        Log("ddraw Blt address not found");
+
+    std::vector<void*> blt;
+    std::vector<void*> bltFast;
+    std::vector<void*> flip;
+    FindDdrawSurfaceAddresses(blt, bltFast, flip);
+    if (blt.empty()) {
+        Log("ddraw surface addresses not found");
         return false;
     }
-    MH_CreateHook(blt, reinterpret_cast<LPVOID>(&DdrawBltDetour), reinterpret_cast<LPVOID*>(&g_originalDdrawBlt));
-    MH_EnableHook(blt);
-    Log("ddraw Blt hooked");
-    return true;
+
+    bool hooked = false;
+    for (void* address : blt) {
+        hooked |= HookDdrawAddress(address, g_originalDdrawBlt, kBltDetours, "Blt");
+    }
+    for (void* address : bltFast) {
+        hooked |= HookDdrawAddress(address, g_originalDdrawBltFast, kBltFastDetours, "BltFast");
+    }
+    for (void* address : flip) {
+        hooked |= HookDdrawAddress(address, g_originalDdrawFlip, kFlipDetours, "Flip");
+    }
+    return hooked;
 }
 
 HRESULT WINAPI PresentDetour(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
@@ -1659,6 +2108,10 @@ bool InstallPresentHook()
 
 bool InstallEndSceneHook()
 {
+    if (g_originalEndScene != nullptr) {
+        return true;
+    }
+
     void* endScene = FindEndSceneAddress();
     if (endScene == nullptr) {
         return false;
@@ -1668,7 +2121,8 @@ bool InstallEndSceneHook()
                                             reinterpret_cast<LPVOID*>(&g_originalEndScene));
     Log("MH_CreateHook(EndScene)=" + std::to_string(static_cast<int>(created)));
     if (created != MH_OK) {
-        return false;
+        // Another path (the Direct3DCreate9 CreateDevice detour) may have hooked it first.
+        return created == MH_ERROR_ALREADY_CREATED && g_originalEndScene != nullptr;
     }
 
     const MH_STATUS enabled = MH_EnableHook(endScene);
@@ -1676,6 +2130,27 @@ bool InstallEndSceneHook()
     return enabled == MH_OK;
 }
 
+bool InstallD3D8HookForTarget()
+{
+    return InstallD3D8Hooks(&g_writer, []() { return ShouldCapture(); }, [](const char* text) { Log(text); });
+}
+
+bool TryInstallHook(bool& installed, ULONGLONG& nextAttempt, ULONGLONG now, bool (*install)())
+{
+    if (installed) {
+        return true;
+    }
+    if (now < nextAttempt) {
+        return false;
+    }
+    installed = install();
+    nextAttempt = GetTickCount64() + (installed ? 0 : 2000);
+    return installed;
+}
+
+// Stays resident for the life of the target process. Graphics modules often load long after the
+// initial injection (Halo's wrapper reports "D3D9 not found!" during startup), so the thread
+// rescans on a timer and on the host's re-hook event instead of giving up after one minute.
 DWORD WINAPI HookThread(LPVOID /*parameter*/)
 {
     g_log.open(ModuleDirectory(g_module) + L"\\wxr_hook.log", std::ios::app);
@@ -1694,71 +2169,87 @@ DWORD WINAPI HookThread(LPVOID /*parameter*/)
         return 0;
     }
 
-    // The graphics module may not be loaded yet if we arrived during startup. Poll for it instead
-    // of giving up, but stop once a hook is installed and the other APIs have had a fair chance.
+    const std::wstring rescanName = std::wstring(kHookRescanEventPrefix) +
+                                    std::to_wstring(GetCurrentProcessId());
+    HANDLE rescan = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, rescanName.c_str());
+    if (rescan == nullptr) {
+        rescan = CreateEventW(nullptr, FALSE, FALSE, rescanName.c_str());
+    }
+    Log(std::string("rehook event ") + (rescan != nullptr ? "ready" : "unavailable"));
+
     bool hookedPresent = false;
+    bool hookedCreate9 = false;
     bool hooked9 = false;
     bool hooked8 = false;
-    bool hooked7 = false;
+    bool hookedDdraw = false;
     bool hookedGL = false;
     bool hooked12 = false;
     bool hookedVK = false;
     bool readySignaled = false;
-    ULONGLONG firstHookAt = 0;
-    ULONGLONG lastPresentAttempt = 0;
-    const ULONGLONG deadline = GetTickCount64() + 60000;
+    unsigned int lastMask = 0;
 
-    while (GetTickCount64() < deadline) {
-        if (!hookedPresent && (GetModuleHandleW(L"d3d11.dll") != nullptr || GetModuleHandleW(L"d3d12.dll") != nullptr) &&
-            GetTickCount64() - lastPresentAttempt > 1000) {
-            lastPresentAttempt = GetTickCount64();
-            hookedPresent = InstallPresentHook();
+    ULONGLONG nextPresent = 0;
+    ULONGLONG nextCreate9 = 0;
+    ULONGLONG nextEndScene9 = 0;
+    ULONGLONG nextD3D8 = 0;
+    ULONGLONG nextDdraw = 0;
+    ULONGLONG nextGL = 0;
+    ULONGLONG nextD3D12 = 0;
+    ULONGLONG nextVK = 0;
+
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+
+        if (GetModuleHandleW(L"d3d11.dll") != nullptr || GetModuleHandleW(L"d3d12.dll") != nullptr) {
+            TryInstallHook(hookedPresent, nextPresent, now, &InstallPresentHook);
         }
-        if (!hooked9 && GetModuleHandleW(L"d3d9.dll") != nullptr) {
-            hooked9 = InstallEndSceneHook();
+        if (GetModuleHandleW(L"d3d9.dll") != nullptr) {
+            TryInstallHook(hookedCreate9, nextCreate9, now, &InstallD3D9CreateHooks);
+            // For targets whose device already exists (injected after startup), the create hook
+            // never fires, so probe a dummy device for EndScene as a slower fallback.
+            TryInstallHook(hooked9, nextEndScene9, now, &InstallEndSceneHook);
         }
-        if (!hooked8 && GetModuleHandleW(L"d3d8.dll") != nullptr) {
-            hooked8 = InstallD3D8Hooks(&g_writer, []() { return ShouldCapture(); },
-                                       [](const char* text) { Log(text); });
+        if (GetModuleHandleW(L"d3d8.dll") != nullptr) {
+            TryInstallHook(hooked8, nextD3D8, now, &InstallD3D8HookForTarget);
         }
-        if (!hooked7 && GetModuleHandleW(L"ddraw.dll") != nullptr) {
-            hooked7 = InstallD3D7Hooks();
+        if (GetModuleHandleW(L"ddraw.dll") != nullptr) {
+            TryInstallHook(hookedDdraw, nextDdraw, now, &InstallDdrawHooks);
         }
-        if (!hookedGL && GetModuleHandleW(L"opengl32.dll") != nullptr) {
-            hookedGL = InstallOpenGLHooks();
+        if (GetModuleHandleW(L"opengl32.dll") != nullptr) {
+            TryInstallHook(hookedGL, nextGL, now, &InstallOpenGLHooks);
         }
-        if (!hooked12 && GetModuleHandleW(L"d3d12.dll") != nullptr) {
-            hooked12 = InstallD3D12Hooks();
+        if (GetModuleHandleW(L"d3d12.dll") != nullptr) {
+            TryInstallHook(hooked12, nextD3D12, now, &InstallD3D12Hooks);
         }
-        if (!hookedVK && GetModuleHandleW(L"vulkan-1.dll") != nullptr) {
-            hookedVK = InstallVulkanHooks();
+        if (GetModuleHandleW(L"vulkan-1.dll") != nullptr) {
+            TryInstallHook(hookedVK, nextVK, now, &InstallVulkanHooks);
         }
 
+        // Release the suspended launcher once the first probe has run, so static imports are
+        // hooked before the app creates its device.
         if (!readySignaled) {
             SignalReady();
             readySignaled = true;
         }
 
-        if (hookedPresent || hooked9 || hooked8 || hooked7 || hookedGL || hooked12 || hookedVK) {
-            if (firstHookAt == 0) {
-                firstHookAt = GetTickCount64();
-            } else if (GetTickCount64() - firstHookAt > 5000) {
-                break;
-            }
+        const unsigned int mask = (hookedPresent ? 1u : 0u) | (hookedCreate9 ? 2u : 0u) | (hooked9 ? 4u : 0u) |
+                                  (hooked8 ? 8u : 0u) | (hookedDdraw ? 16u : 0u) | (hookedGL ? 32u : 0u) |
+                                  (hooked12 ? 64u : 0u) | (hookedVK ? 128u : 0u);
+        if (mask != lastMask) {
+            lastMask = mask;
+            Log(std::string("hooks now: present=") + (hookedPresent ? "yes" : "no") + " create9=" +
+                (hookedCreate9 ? "yes" : "no") + " d3d9=" + (hooked9 ? "yes" : "no") + " d3d8=" +
+                (hooked8 ? "yes" : "no") + " ddraw=" + (hookedDdraw ? "yes" : "no") + " gl=" +
+                (hookedGL ? "yes" : "no") + " d3d12=" + (hooked12 ? "yes" : "no") + " vulkan=" +
+                (hookedVK ? "yes" : "no"));
         }
 
-        if (!hookedPresent && !hooked9 && !hooked8 && !hooked7 && !hookedGL && !hooked12 && !hookedVK) {
-            Sleep(250);
+        if (rescan != nullptr) {
+            WaitForSingleObject(rescan, 2000);
         } else {
-            Sleep(500);
+            Sleep(2000);
         }
     }
-
-    Log(std::string("hooks installed: present=") + (hookedPresent ? "yes" : "no") + " d3d9=" +
-        (hooked9 ? "yes" : "no") + " d3d8=" + (hooked8 ? "yes" : "no") + " d3d7=" +
-        (hooked7 ? "yes" : "no") + " gl=" + (hookedGL ? "yes" : "no") + " d3d12=" +
-        (hooked12 ? "yes" : "no") + " vulkan=" + (hookedVK ? "yes" : "no"));
-    return 0;
 }
 
 }  // namespace

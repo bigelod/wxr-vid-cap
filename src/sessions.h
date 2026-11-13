@@ -17,7 +17,7 @@ public:
     Recorder& operator=(const Recorder&) = delete;
 
     bool Start(const std::wstring& path, const std::wstring& targetExecutable, std::wstring& error,
-               int hookTimeoutMs = 6000);
+               int hookTimeoutMs = 6000, int retryTimeoutMs = 0);
     void Stop();
 
     bool Active() const;
@@ -44,7 +44,8 @@ public:
     Caster& operator=(const Caster&) = delete;
 
     bool Start(const std::wstring& host, unsigned short port, const std::wstring& targetExecutable,
-               std::wstring& error, int hookTimeoutMs = 6000);
+               std::wstring& error, int hookTimeoutMs = 6000, int jitterFrames = 8,
+               int retryTimeoutMs = 0);
     void Stop();
 
     // Switches the live cast to another capture source. An empty executable means the top-most

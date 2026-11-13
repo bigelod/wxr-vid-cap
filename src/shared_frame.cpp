@@ -10,6 +10,13 @@ std::wstring SharedFrameName(unsigned long processId)
     return std::wstring(kSharedFrameNamePrefix) + suffix;
 }
 
+std::wstring HookRescanEventName(unsigned long processId)
+{
+    wchar_t suffix[32] = {};
+    swprintf_s(suffix, L"%lu", processId);
+    return std::wstring(kHookRescanEventPrefix) + suffix;
+}
+
 SharedFrameWriter::~SharedFrameWriter()
 {
     Close();

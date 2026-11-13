@@ -200,7 +200,7 @@ int wWinMain(HINSTANCE /*instance*/, HINSTANCE /*previous*/, PWSTR /*commandLine
     }
 
     if (ready != nullptr) {
-        WaitForSingleObject(ready, 10000);
+        WaitForSingleObject(ready, 20000);
         CloseHandle(ready);
     }
 

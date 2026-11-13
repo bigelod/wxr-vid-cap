@@ -5,6 +5,8 @@
 struct AppSettings {
     std::wstring receiverIp;
     unsigned short port = 1234;
+    // Number of 24 fps frames buffered before sending. Adds a small delay, smooths VLC playback.
+    int castJitterFrames = 8;
     // Empty means "capture the top-most window"; otherwise the full path of the EXE to follow.
     // Shared by local recording and LAN casting.
     std::wstring captureTargetExe;

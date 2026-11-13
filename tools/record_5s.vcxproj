@@ -82,6 +82,7 @@
     <ClCompile Include="..\src\opus_audio_encoder.cpp" />
     <ClCompile Include="..\src\screen_capture.cpp" />
     <ClCompile Include="..\src\sessions.cpp" />
+    <ClCompile Include="..\src\ts_muxer.cpp" />
     <ClCompile Include="..\src\udp_sender.cpp" />
     <ClCompile Include="..\src\process_list.cpp" />
     <ClCompile Include="..\src\exclusions.cpp" />

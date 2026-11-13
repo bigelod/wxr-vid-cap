@@ -20,8 +20,10 @@ public:
     HookCapture& operator=(const HookCapture&) = delete;
 
     // Finds the target process, injects the matching hook DLL, and waits for the first frame.
+    // retryTimeoutMs runs a second wait after signaling the resident hook to rescan its modules,
+    // for titles that create their D3D9 device late or load d3d9.dll on demand.
     bool Start(const std::wstring& targetExecutable, int width, int height, std::wstring& error,
-               int firstFrameTimeoutMs = 6000);
+               int firstFrameTimeoutMs = 6000, int retryTimeoutMs = 0);
     void Stop();
 
     // Waits up to timeoutMs for a frame newer than the last one returned. The result is always
@@ -39,6 +41,7 @@ public:
 
 private:
     SharedFrameReader reader_;
+    HANDLE rescanEvent_ = nullptr;
     unsigned long processId_ = 0;
     int width_ = 0;
     int height_ = 0;

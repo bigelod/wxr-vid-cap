@@ -9,6 +9,7 @@
 #include <commdlg.h>
 #include <mmsystem.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cmath>
@@ -34,6 +35,7 @@ namespace {
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kShowMenuMessage = WM_APP + 2;
+constexpr UINT kTaskmgrShownMessage = WM_APP + 3;
 constexpr UINT_PTR kTrayIconId = 1;
 
 constexpr UINT kMenuShow = 40001;
@@ -47,6 +49,7 @@ constexpr UINT kMenuSelectCastSource = 40007;
 constexpr UINT_PTR kSessionTimerId = 1;
 constexpr ULONGLONG kMaxRecordingMs = 15ull * 60ull * 1000ull;
 constexpr int kLaunchHookTimeoutMs = 30000;
+constexpr int kLateHookTimeoutMs = 30000;
 
 const wchar_t kWindowClass[] = L"WxrVidCapTrayWindow";
 
@@ -58,6 +61,8 @@ struct AppState {
     HICON trayIcon = nullptr;
     HANDLE instanceMutex = nullptr;
     UINT taskbarCreatedMessage = 0;
+    HWINEVENTHOOK taskmgrShowHook = nullptr;
+    HWINEVENTHOOK taskmgrForegroundHook = nullptr;
     ULONGLONG recordingStart = 0;
     AppSettings settings;
     SessionMode mode = SessionMode::Idle;
@@ -358,6 +363,206 @@ void ShowMainWindow()
     if (g_app.mainWindow != nullptr) {
         UpdateMainWindow();
         BringWindowToFront(g_app.mainWindow);
+    }
+}
+
+// WinlatorXR exposes the Android filesystem under Z:\. Only then is taskmgr known to be a stray
+// Wine tool window rather than a native Windows process the user intentionally opened.
+bool IsWinlatorXR()
+{
+    return GetFileAttributesW(L"Z:\\tmp") != INVALID_FILE_ATTRIBUTES;
+}
+
+std::wstring ProcessImagePathForPid(unsigned long processId)
+{
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr) {
+        return {};
+    }
+    wchar_t path[MAX_PATH * 4] = {};
+    DWORD size = ARRAYSIZE(path);
+    std::wstring result;
+    if (QueryFullProcessImageNameW(process, 0, path, &size)) {
+        result.assign(path, size);
+    }
+    CloseHandle(process);
+    return result;
+}
+
+bool ProcessIsAlive(unsigned long processId)
+{
+    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr) {
+        return false;
+    }
+    DWORD exitCode = 0;
+    const bool alive = GetExitCodeProcess(process, &exitCode) && exitCode == STILL_ACTIVE;
+    CloseHandle(process);
+    return alive;
+}
+
+struct CloseTaskmgrContext {
+    const std::vector<unsigned long>* processIds = nullptr;
+};
+
+BOOL CALLBACK CloseTaskmgrWindowProc(HWND window, LPARAM context)
+{
+    auto* close = reinterpret_cast<CloseTaskmgrContext*>(context);
+    DWORD processId = 0;
+    GetWindowThreadProcessId(window, &processId);
+    for (unsigned long candidate : *close->processIds) {
+        if (candidate == processId) {
+            PostMessageW(window, WM_CLOSE, 0, 0);
+            break;
+        }
+    }
+    return TRUE;
+}
+
+// Closes taskmgr instances: WM_CLOSE first so a taskmgr that is doing real work can finish, then a
+// forced terminate if it is still alive after two seconds. Only runs on WinlatorXR.
+void CloseTaskManagerInstances()
+{
+    if (!IsWinlatorXR()) {
+        return;
+    }
+
+    std::vector<unsigned long> processIds;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W process = {};
+        process.dwSize = sizeof(process);
+        if (Process32FirstW(snapshot, &process) != FALSE) {
+            do {
+                if (_wcsicmp(process.szExeFile, L"taskmgr.exe") == 0 &&
+                    process.th32ProcessID != GetCurrentProcessId()) {
+                    processIds.push_back(process.th32ProcessID);
+                }
+            } while (Process32NextW(snapshot, &process) != FALSE);
+        }
+        CloseHandle(snapshot);
+    }
+    if (processIds.empty()) {
+        return;
+    }
+
+    CloseTaskmgrContext context;
+    context.processIds = &processIds;
+    EnumWindows(CloseTaskmgrWindowProc, reinterpret_cast<LPARAM>(&context));
+
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    for (;;) {
+        bool anyAlive = false;
+        for (unsigned long processId : processIds) {
+            if (ProcessIsAlive(processId)) {
+                anyAlive = true;
+                break;
+            }
+        }
+        if (!anyAlive || GetTickCount64() >= deadline) {
+            break;
+        }
+        Sleep(100);
+    }
+
+    for (unsigned long processId : processIds) {
+        if (!ProcessIsAlive(processId)) {
+            continue;
+        }
+        HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, processId);
+        if (process == nullptr) {
+            continue;
+        }
+        TerminateProcess(process, 1);
+        WaitForSingleObject(process, 1000);
+        CloseHandle(process);
+    }
+}
+
+// Brings the window of a selected capture target to the foreground. Attaching to the foreground
+// thread works around SetForegroundWindow's focus-stealing rules on both Windows and Wine.
+void ActivateProcessWindow(const ProcessEntry& entry)
+{
+    if (entry.window == nullptr || !IsWindow(entry.window)) {
+        return;
+    }
+
+    if (IsIconic(entry.window)) {
+        ShowWindow(entry.window, SW_RESTORE);
+    } else {
+        ShowWindow(entry.window, SW_SHOW);
+    }
+
+    const DWORD currentThread = GetCurrentThreadId();
+    const HWND foreground = GetForegroundWindow();
+    const DWORD foregroundThread = foreground != nullptr ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const DWORD targetThread = GetWindowThreadProcessId(entry.window, nullptr);
+
+    if (foregroundThread != 0 && foregroundThread != currentThread) {
+        AttachThreadInput(currentThread, foregroundThread, TRUE);
+    }
+    if (targetThread != 0 && targetThread != currentThread) {
+        AttachThreadInput(currentThread, targetThread, TRUE);
+    }
+
+    BringWindowToTop(entry.window);
+    SetForegroundWindow(entry.window);
+
+    if (targetThread != 0 && targetThread != currentThread) {
+        AttachThreadInput(currentThread, targetThread, FALSE);
+    }
+    if (foregroundThread != 0 && foregroundThread != currentThread) {
+        AttachThreadInput(currentThread, foregroundThread, FALSE);
+    }
+}
+
+void CALLBACK TaskmgrWinEventProc(HWINEVENTHOOK /*hook*/, DWORD /*event*/, HWND window, LONG idObject, LONG idChild,
+                                  DWORD /*thread*/, DWORD /*time*/)
+{
+    if (window == nullptr || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
+        return;
+    }
+    if (GetAncestor(window, GA_ROOT) != window || !IsWindowVisible(window)) {
+        return;
+    }
+
+    DWORD processId = 0;
+    GetWindowThreadProcessId(window, &processId);
+    if (processId == 0 || processId == GetCurrentProcessId()) {
+        return;
+    }
+
+    const std::wstring path = ProcessImagePathForPid(processId);
+    if (path.empty() || _wcsicmp(FileNameOf(path).c_str(), L"taskmgr.exe") != 0) {
+        return;
+    }
+
+    PostMessageW(g_app.window, kTaskmgrShownMessage, 0, 0);
+}
+
+void InstallTaskmgrWatcher()
+{
+    if (g_app.taskmgrShowHook == nullptr) {
+        g_app.taskmgrShowHook =
+            SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, TaskmgrWinEventProc, 0, 0,
+                            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    if (g_app.taskmgrForegroundHook == nullptr) {
+        g_app.taskmgrForegroundHook =
+            SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, TaskmgrWinEventProc, 0, 0,
+                            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+}
+
+void UninstallTaskmgrWatcher()
+{
+    if (g_app.taskmgrShowHook != nullptr) {
+        UnhookWinEvent(g_app.taskmgrShowHook);
+        g_app.taskmgrShowHook = nullptr;
+    }
+    if (g_app.taskmgrForegroundHook != nullptr) {
+        UnhookWinEvent(g_app.taskmgrForegroundHook);
+        g_app.taskmgrForegroundHook = nullptr;
     }
 }
 
@@ -670,6 +875,27 @@ void SetSelectedProcessPath(HWND dialog, CaptureSourceDialogContext* context)
                     context->windows[static_cast<std::size_t>(item)].executablePath.c_str());
 }
 
+// Selecting a running app brings it forward and clears stray taskmgr windows on WinlatorXR.
+void ActivateSelectedCaptureTarget(HWND dialog, CaptureSourceDialogContext* context)
+{
+    if (context == nullptr) {
+        return;
+    }
+
+    const LRESULT index = SendDlgItemMessageW(dialog, IDC_PROCESS_LIST, LB_GETCURSEL, 0, 0);
+    if (index == LB_ERR) {
+        return;
+    }
+    const LRESULT item =
+        SendDlgItemMessageW(dialog, IDC_PROCESS_LIST, LB_GETITEMDATA, static_cast<WPARAM>(index), 0);
+    if (item < 0 || static_cast<std::size_t>(item) >= context->windows.size()) {
+        return;
+    }
+
+    CloseTaskManagerInstances();
+    ActivateProcessWindow(context->windows[static_cast<std::size_t>(item)]);
+}
+
 void PopulateProcessList(HWND dialog, CaptureSourceDialogContext* context)
 {
     HWND list = GetDlgItem(dialog, IDC_PROCESS_LIST);
@@ -772,6 +998,7 @@ INT_PTR CALLBACK CaptureSourceDialogProc(HWND dialog, UINT message, WPARAM wPara
             if (HIWORD(wParam) == LBN_SELCHANGE) {
                 auto* context = reinterpret_cast<CaptureSourceDialogContext*>(GetWindowLongPtrW(dialog, GWLP_USERDATA));
                 SetSelectedProcessPath(dialog, context);
+                ActivateSelectedCaptureTarget(dialog, context);
                 return TRUE;
             }
             return FALSE;
@@ -1141,8 +1368,10 @@ void BeginRecordLocal()
     PlayRecordingStartSound();
 
     std::wstring error;
-    const int hookTimeout = (source.kind == CaptureSource::Kind::Launch) ? kLaunchHookTimeoutMs : 6000;
-    if (!g_app.recorder.Start(path, source.executable, error, hookTimeout)) {
+    const bool launched = source.kind == CaptureSource::Kind::Launch;
+    const int hookTimeout = launched ? kLaunchHookTimeoutMs : 6000;
+    const int retryTimeout = launched ? kLateHookTimeoutMs : 0;
+    if (!g_app.recorder.Start(path, source.executable, error, hookTimeout, retryTimeout)) {
         PlayHookFailureSound();
         MessageBoxW(DialogOwner(), (L"Could not start recording.\n\n" + error).c_str(), L"wxr-vid-cap",
                     MB_OK | MB_ICONERROR);
@@ -1188,9 +1417,11 @@ void BeginCastLocal()
     PlayRecordingStartSound();
 
     std::wstring error;
-    const int hookTimeout = (source.kind == CaptureSource::Kind::Launch) ? kLaunchHookTimeoutMs : 6000;
+    const bool launched = source.kind == CaptureSource::Kind::Launch;
+    const int hookTimeout = launched ? kLaunchHookTimeoutMs : 6000;
+    const int retryTimeout = launched ? kLateHookTimeoutMs : 0;
     if (!g_app.caster.Start(g_app.settings.receiverIp, g_app.settings.port, source.executable, error,
-                            hookTimeout)) {
+                            hookTimeout, g_app.settings.castJitterFrames, retryTimeout)) {
         PlayHookFailureSound();
         MessageBoxW(DialogOwner(), (L"Could not start casting.\n\n" + error).c_str(), L"wxr-vid-cap",
                     MB_OK | MB_ICONERROR);
@@ -1394,6 +1625,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case kShowMenuMessage:
         ShowMainWindow();
         return 0;
+    case kTaskmgrShownMessage:
+        ShowMainWindow();
+        return 0;
     case WM_TIMER:
         if (wParam == kSessionTimerId && g_app.mode == SessionMode::Recording) {
             if (!g_app.recorder.Active()) {
@@ -1423,6 +1657,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        UninstallTaskmgrWatcher();
         RemoveTrayIcon();
         if (g_app.instanceMutex != nullptr) {
             CloseHandle(g_app.instanceMutex);
@@ -1528,6 +1763,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE /*previousInstance*/, PWSTR /*
                     L"wxr-vid-cap", MB_OK | MB_ICONERROR);
         return 1;
     }
+
+    InstallTaskmgrWatcher();
 
     MSG message = {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

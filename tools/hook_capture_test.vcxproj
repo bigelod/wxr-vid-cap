@@ -74,6 +74,7 @@
     <ClCompile Include="hook_capture_test.cpp" />
     <ClCompile Include="..\src\hook_capture.cpp" />
     <ClCompile Include="..\src\injection.cpp" />
+    <ClCompile Include="..\src\exclusions.cpp" />
     <ClCompile Include="..\src\shared_frame.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

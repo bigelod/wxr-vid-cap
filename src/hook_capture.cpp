@@ -4,6 +4,7 @@
 #include "injection.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cmath>
@@ -49,8 +50,55 @@ std::wstring HookLogTail()
     return wide;
 }
 
-bool RunHelper(const std::wstring& path, unsigned long processId, const std::wstring& dllPath, std::wstring& error)
+bool IsProcessAlive(unsigned long processId)
 {
+    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr) {
+        return false;
+    }
+    DWORD exitCode = 0;
+    const bool alive = GetExitCodeProcess(process, &exitCode) && exitCode == STILL_ACTIVE;
+    CloseHandle(process);
+    return alive;
+}
+
+// Names the graphics APIs the target has loaded so a failed hook is diagnosable on-device.
+std::wstring LoadedGraphicsModules(unsigned long processId)
+{
+    struct Entry {
+        const wchar_t* module;
+        const wchar_t* label;
+    };
+    const Entry entries[] = {{L"d3d9.dll", L"D3D9"},       {L"d3d8.dll", L"D3D8"},
+                             {L"ddraw.dll", L"DirectDraw"}, {L"d3d11.dll", L"D3D11"},
+                             {L"d3d12.dll", L"D3D12"},      {L"opengl32.dll", L"OpenGL"},
+                             {L"vulkan-1.dll", L"Vulkan"}};
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return L"unknown";
+    }
+
+    std::wstring result;
+    MODULEENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    if (Module32FirstW(snapshot, &entry) != FALSE) {
+        do {
+            for (const Entry& candidate : entries) {
+                if (_wcsicmp(entry.szModule, candidate.module) == 0) {
+                    if (!result.empty()) {
+                        result += L", ";
+                    }
+                    result += candidate.label;
+                }
+            }
+        } while (Module32NextW(snapshot, &entry) != FALSE);
+    }
+    CloseHandle(snapshot);
+    return result.empty() ? L"none loaded" : result;
+}
+
+bool RunHelper(const std::wstring& path, unsigned long processId, const std::wstring& dllPath, std::wstring& error){
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         error = L"Helper not found: " + path;
         return false;
@@ -147,7 +195,7 @@ HookCapture::~HookCapture()
 }
 
 bool HookCapture::Start(const std::wstring& targetExecutable, int width, int height, std::wstring& error,
-                        int firstFrameTimeoutMs)
+                        int firstFrameTimeoutMs, int retryTimeoutMs)
 {
     Stop();
 
@@ -171,6 +219,10 @@ bool HookCapture::Start(const std::wstring& targetExecutable, int width, int hei
         error = L"Could not create the shared frame mapping.";
         return false;
     }
+
+    // The resident hook DLL opens this event and rescans its loaded modules when it is signaled.
+    const std::wstring eventName = HookRescanEventName(processId_);
+    rescanEvent_ = CreateEventW(nullptr, FALSE, FALSE, eventName.c_str());
 
     width_ = width;
     height_ = height;
@@ -230,25 +282,53 @@ bool HookCapture::Start(const std::wstring& targetExecutable, int width, int hei
     int sourceWidth = 0;
     int sourceHeight = 0;
     std::int64_t timestamp = 0;
-    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(firstFrameTimeoutMs);
 
-    while (GetTickCount64() < deadline) {
-        if (reader_.Read(frame, sourceWidth, sourceHeight, timestamp)) {
-            sourceWidth_ = sourceWidth;
-            sourceHeight_ = sourceHeight;
-            framesRead_ = 1;
-            pending_ = std::move(frame);
-            hasPending_ = true;
-            active_ = true;
-            return true;
+    const auto waitForFrame = [&](int timeoutMs) {
+        const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(std::max(timeoutMs, 0));
+        while (GetTickCount64() < deadline) {
+            if (reader_.Read(frame, sourceWidth, sourceHeight, timestamp)) {
+                return true;
+            }
+            if (!IsProcessAlive(processId_)) {
+                return false;
+            }
         }
+        return false;
+    };
+
+    bool gotFrame = waitForFrame(firstFrameTimeoutMs);
+
+    // Late hook attempt: ask the resident DLL to rescan now that the game has finished starting.
+    if (!gotFrame && retryTimeoutMs > 0 && IsProcessAlive(processId_)) {
+        if (rescanEvent_ != nullptr) {
+            SetEvent(rescanEvent_);
+        }
+        gotFrame = waitForFrame(retryTimeoutMs);
     }
 
+    if (gotFrame) {
+        sourceWidth_ = sourceWidth;
+        sourceHeight_ = sourceHeight;
+        framesRead_ = 1;
+        pending_ = std::move(frame);
+        hasPending_ = true;
+        active_ = true;
+        return true;
+    }
+
+    const bool targetAlive = IsProcessAlive(processId_);
     reader_.SetEnabled(false);
     reader_.Close();
     active_ = false;
 
-    error = L"The hook loaded (" + injectionMethod_ + L") but no frames arrived.\n\n";
+    if (!targetAlive) {
+        error = L"The capture target closed before the hook produced a frame: " + targetExecutable;
+        return false;
+    }
+
+    error = L"The hook loaded (" + injectionMethod_ + L") but no frames arrived";
+    error += retryTimeoutMs > 0 ? L" during the launch wait or the late retry.\n\n" : L".\n\n";
+    error += L"Graphics APIs loaded by the target: " + LoadedGraphicsModules(processId_) + L"\n\n";
     error += L"For D3D12 or Vulkan targets, use LAUNCH WITH HOOK so the hook is present before the "
              L"device is created.\n\n";
     const std::wstring tail = HookLogTail();
@@ -262,6 +342,10 @@ bool HookCapture::Start(const std::wstring& targetExecutable, int width, int hei
 
 void HookCapture::Stop()
 {
+    if (rescanEvent_ != nullptr) {
+        CloseHandle(rescanEvent_);
+        rescanEvent_ = nullptr;
+    }
     if (reader_.Active()) {
         reader_.SetEnabled(false);
     }

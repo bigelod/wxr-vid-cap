@@ -52,13 +52,13 @@ Copy-Item "$root\build\tools\Win32\$Configuration\wxr_inject32.exe" "$root\build
 Copy-Item "$root\src\capture-blacklist.txt" "$root\build\x64\$Configuration\capture-blacklist.txt" -Force
 
 # Capture test apps (one per graphics API) and the automated runner.
-foreach ($app in @("cube_d3d7", "cube_d3d8", "cube_d3d9", "cube_d3d10", "cube_d3d11", "cube_d3d12", "cube_gl", "cube_vk", "cube_runner")) {
+foreach ($app in @("cube_d3d7", "cube_d3d8", "cube_d3d9", "cube_d3d10", "cube_d3d11", "cube_d3d12", "cube_ddraw", "cube_gl", "cube_vk", "cube_runner")) {
     Build-Project "tools\testapps\$app.vcxproj" "x64"
 }
 
 # 32-bit builds for the runner's 32-bit passes. The container's d3d8 is 32-bit, so this is the
 # path that actually runs the D3D8 test on-device.
-foreach ($app in @("cube_d3d7", "cube_d3d8", "cube_d3d9", "cube_d3d10", "cube_d3d11", "cube_d3d12", "cube_gl")) {
+foreach ($app in @("cube_d3d7", "cube_d3d8", "cube_d3d9", "cube_d3d10", "cube_d3d11", "cube_d3d12", "cube_ddraw", "cube_gl")) {
     Build-Project "tools\testapps\$app.vcxproj" "Win32"
     Copy-Item "$root\build\testapps\Win32\$Configuration\${app}32.exe" "$root\build\testapps\$Configuration\${app}32.exe" -Force
 }

@@ -14,11 +14,13 @@
 // The mapping is named after the target process so a hook DLL left in an older target cannot feed
 // frames into a later capture session.
 constexpr wchar_t kSharedFrameNamePrefix[] = L"Local\\wxrvidcap_frames_";
+constexpr wchar_t kHookRescanEventPrefix[] = L"Local\\wxrvidcap_rehook_";
 constexpr int kSharedMaxWidth = 1920;
 constexpr int kSharedMaxHeight = 1080;
 constexpr int kSharedSlotCount = 2;
 
 std::wstring SharedFrameName(unsigned long processId);
+std::wstring HookRescanEventName(unsigned long processId);
 
 struct SharedFrameHeader {
     volatile LONG enabled;  // writer captures only while non-zero

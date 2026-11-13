@@ -1,8 +1,10 @@
 # Current Tasks
 
-Work in progress, in priority order. The project is at the scaffolding stage: the repository has
-a README and `.gitignore` and no source yet, so the first block is about choosing foundations
-before writing capture code.
+Work in progress, in priority order. Recent additions: the resident hook now re-scans modules after
+launch (with a 30 s + 30 s launch retry for late D3D9 creation), DirectDraw Blt/BltFast/Flip capture
+with legacy interface support, a `cube_ddraw` test app, a cast jitter buffer, a touch-friendly IP
+keypad, and taskmgr-driven SHOW plus focus/close helpers. Build with `.\build.ps1` and validate with
+`build\tests\x64\Release\wxr-vid-cap-tests.exe` plus the per-API test apps.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `COMPLETED_TASKS.md`)
 
@@ -84,10 +86,18 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
   message box in `src/main.cpp`.
 - [x] Tray menu: `SHOW` / `RECORD LOCAL` / `CAST LOCAL` / `EXIT` when idle;
   `STOP RECORDING` or `STOP CASTING` while active. `SHOW` opens the same actions in a window.
-- [x] `RECORD LOCAL`: capture source screen, then a Save dialog in `D:\` pre-filled with
-  `recording_YYYY-MM-DD_hhmmss.mkv`; start immediately on OK, no-op on Cancel.
-- [x] `CAST LOCAL`: receiver IPv4 dialog prefilled with the last address, then the capture source
-  screen. Persisted to `%APPDATA%\wxr-vid-cap\settings.ini`.
+- [x] `RECORD LOCAL`: capture source screen, then a Save dialog prefilled with
+  `D:\WXRVIDCAP\capture_YYYY-MM-DD_hh_mm_ss.mkv`; the directory is created when missing, with a
+  Videos/app-directory fallback when `D:\` is unavailable. Start immediately on OK, no-op on Cancel.
+- [x] `CAST LOCAL`: receiver IPv4 dialog with a touch keypad (`7 8 9 / 4 5 6 / 1 2 3 / 0 . BSP`),
+  then the capture source screen. A blank value starts at `192.168.0.`, and the confirmed address
+  is persisted to `%APPDATA%\wxr-vid-cap\settings.ini`.
+- [x] **Cast jitter buffer.** Muxed video frames are queued (default 8 frames, `[cast]
+  jitter_frames`, 0 disables) and sent from a dedicated thread at a steady 24 fps cadence. Adds
+  receiver-side latency but absorbs encode/network jitter for smoother VLC playback.
+- [x] **taskmgr integration.** Opening `taskmgr.exe` triggers SHOW. Selecting a running app in the
+  source list brings that app forward; on WinlatorXR (`Z:\tmp` exists) taskmgr instances are closed
+  first with `WM_CLOSE`, then force-terminated if still alive after two seconds.
 - [x] Capture source screen: top-most window (default), a running application from a list, or
   launch an EXE with the hook (`Recommended for D3D11/12 and Vulkan`).
 - [x] Explicit session state machine (idle / recording / casting) so the two modes cannot overlap
@@ -130,14 +140,30 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
   `TRANSFER_SRC` usage) and `vkQueuePresentKHR`. Verified with `cube_vk`.
 - [x] **D3D7 capture.** Hooks `IDirectDrawSurface7::Blt` and reads the source back buffer before
   the blit. Verified with `cube_d3d7` windowed and fullscreen.
+- [x] **DirectDraw capture expansion.** Hooks `Blt`, `BltFast`, and `Flip` on both `IDirectDraw7`
+  and legacy `IDirectDraw` surface vtables, so CNC-Ddraw and older 2D titles are covered. Blits into
+  an offscreen back buffer are read at the destination; blits to the desktop-sized windowed primary
+  are read from the source back buffer. 32-bit BGRA and 16-bit RGB565/RGB555 surfaces are supported.
+  Verified 32-bit and 64-bit with `cube_ddraw` at ~30 fps.
+- [x] **Resident hook with late attachment.** The injected DLL stays resident, rescans loaded
+  modules every two seconds, and rescans immediately when the host signals
+  `Local\wxrvidcap_rehook_<pid>`. Launch sessions wait 30 s for the first frame and then 30 s more
+  after the rescan signal, for games that create D3D9 late (Halo CE's "D3D9 not found!" wrapper).
+- [x] **D3D9 create path.** Hooks `Direct3DCreate9`/`Direct3DCreate9Ex` and the real
+  `IDirect3D9::CreateDevice` (vtable slot 16), then hooks `EndScene` on the returned device. The
+  dummy-device vtable probe remains for targets injected after their device already exists.
+- [x] **`cube_ddraw` test app.** Same bytebeat audio, a 2D rotating rectangle, and a `DDRAW` label;
+  windowed Blt and `--fullscreen` Flip paths in one executable, built x86 and x64.
+- [x] **Launch diagnostics.** Hook failures list the graphics APIs loaded by the target (D3D9,
+  D3D8, DirectDraw, D3D11, D3D12, OpenGL, Vulkan) alongside the hook log tail.
 - [x] **D3D8 capture.** Hooks `IDirect3DDevice8::Present` and reads the back buffer with
   `GetBackBuffer` + `LockRect`. The container's d3d8 is 32-bit, so the 32-bit pass uses
   `cube_d3d832.exe` and injects the 32-bit hook through `wxr_inject32.exe`.
-- [ ] **Validate the eight test apps on-device.** Run `cube_runner.exe` once; it records every API
+- [ ] **Validate the test apps on-device.** Run `cube_runner.exe` once; it records every API
   windowed and fullscreen, in 64-bit and 32-bit builds, keeps the videos, and writes one
   `cube_tests.log`. Check each app's `testapp.log` for API/audio status and inspect each MKV for the
   renderer label. The 32-bit D3D8 pass is the one that matches the container's d3d8; D3D12 needs
-  vkd3d-proton.
+  vkd3d-proton. `cube_ddraw.exe`/`cube_ddraw32.exe` cover the new DirectDraw path.
 - [x] **Integrate with Recorder/Caster.** `Recorder` and `Caster` share the same hook-first capture
   path; the recorder writes MKV, the caster encodes the same frames and audio to MPEG-TS/UDP.
 - [ ] **Safety:** only inject into the process the user picked; never into system/anti-cheat
@@ -165,7 +191,10 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
   sent for 10 s; VLC 3.0.24 decoded the Opus track as two-channel audio alongside H.264.
 - [x] Automatic source fallback: if the selected window closes, recording tries to re-hook the
   top-most application and stops with an error if none is available. Casting keeps running with
-  black video and silent audio, shows `waiting for a source`, and retries periodically.
+  black video and silent audio, shows `waiting for a source`, and retries periodically. A
+  specifically selected app is pinned: while its process is open, both recorder and caster keep
+  retrying that same app, and the caster no longer drifts to another top-most window. The default
+  top-most pick is pinned once it hooks successfully.
 - [x] Remove the GDI fallback from the tray app. `Capture the top-most window` now resolves to a
   hookable EXE; the standalone GDI probes remain only for Windows diagnostics.
 - [x] `capture-blacklist.txt` beside the app excludes `taskmgr.exe`, `explorer.exe`, `notepad.exe`,
