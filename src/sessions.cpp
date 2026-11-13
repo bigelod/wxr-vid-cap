@@ -4,9 +4,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -19,12 +21,12 @@
 #include "audio_capture.h"
 #include "audio_resampler.h"
 #include "color_convert.h"
+#include "exclusions.h"
 #include "h264_encoder.h"
 #include "hook_capture.h"
 #include "mkv_writer.h"
 #include "opus_audio_encoder.h"
 #include "process_list.h"
-#include "screen_capture.h"
 #include "ts_muxer.h"
 
 namespace {
@@ -34,6 +36,10 @@ constexpr int kCaptureHeight = 720;
 constexpr int kCaptureFps = 24;
 constexpr int kVideoBitrateKbps = 4000;
 constexpr int kAudioBitrate = 96000;
+constexpr int kHookRetryTimeoutMs = 1500;
+constexpr int kSourceRetryIntervalMs = 3000;
+constexpr int kHookStallFrames = kCaptureFps * 5;
+constexpr int kTargetMissingLimit = 3;
 
 std::string Narrow(const std::wstring& text)
 {
@@ -54,8 +60,8 @@ std::wstring FileNameOf(const std::wstring& path)
     return (slash == std::wstring::npos) ? path : path.substr(slash + 1);
 }
 
-// Cheap content check: if almost every sampled pixel is black, GDI is probably seeing a window
-// whose GPU-rendered surface is not in the desktop framebuffer.
+// Cheap content check: if almost every sampled pixel is black, the hook is probably seeing a
+// surface that is not the rendered game.
 bool IsMostlyBlack(const std::uint8_t* bgra, int width, int height)
 {
     int nonBlack = 0;
@@ -153,8 +159,6 @@ struct Recorder::Impl {
     std::thread thread;
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> active{false};
-    std::atomic<bool> targetChanged{false};
-    std::atomic<bool> targetChangedGdi{false};
     bool wroteFile = false;
     std::wstring error;
 
@@ -239,15 +243,6 @@ const std::wstring& Recorder::LastError() const
     return impl_ ? impl_->error : empty;
 }
 
-bool Recorder::TakeTargetChanged(bool& usedGdi)
-{
-    if (!impl_ || !impl_->targetChanged.exchange(false)) {
-        return false;
-    }
-    usedGdi = impl_->targetChangedGdi.load();
-    return true;
-}
-
 std::wstring Recorder::Source() const
 {
     if (!impl_) {
@@ -288,40 +283,33 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     }
     logLine("video: 1280x720 @ 24 fps, 4000 kbps");
 
-    ScreenCapture gdi;
     HookCapture hook;
-    bool hookActive = false;
     std::wstring initError;
 
-    if (!targetExecutable.empty()) {
-        if (hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, initError, hookTimeoutMs)) {
-            hookActive = true;
-            logLine("backend: graphics hook");
-            logLine("hook: " + Narrow(hook.LastInjectionMethod()) + ", source " +
-                    std::to_string(hook.SourceWidth()) + "x" + std::to_string(hook.SourceHeight()));
-        } else {
-            logLine("hook: unavailable; falling back to GDI");
-            logLine("hook error: " + Narrow(initError));
-            initError.clear();
+    if (targetExecutable.empty()) {
+        targetExecutable = TopMostWindowExecutable();
+        if (targetExecutable.empty()) {
+            fail(L"No capturable window is running.");
+            return;
         }
     }
 
-    if (!hookActive && !gdi.Initialize(kCaptureWidth, kCaptureHeight, initError, true, targetExecutable)) {
-        logLine("error: could not start screen capture: " + Narrow(initError));
-        fail(L"Could not start screen capture: " + initError);
+    if (!hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, initError, hookTimeoutMs)) {
+        logLine("error: " + Narrow(initError));
+        fail(L"Could not start the graphics hook: " + initError);
         return;
     }
-    if (!hookActive) {
-        logLine("backend: GDI (top-most window)");
-        backend = L"GDI (top-most window)";
-    } else {
-        backend = L"graphics hook";
-    }
+
+    bool hookActive = true;
+    backend = L"graphics hook";
     {
         std::lock_guard<std::mutex> lock(sourceMutex);
-        currentSource = hookActive ? targetExecutable : std::wstring();
+        currentSource = targetExecutable;
     }
-    logLine(targetExecutable.empty() ? "target: top-most window" : "target: " + Narrow(targetExecutable));
+    logLine("backend: graphics hook");
+    logLine("hook: " + Narrow(hook.LastInjectionMethod()) + ", source " +
+            std::to_string(hook.SourceWidth()) + "x" + std::to_string(hook.SourceHeight()));
+    logLine("target: " + Narrow(targetExecutable));
 
     H264Encoder encoder;
     if (!encoder.Initialize(kCaptureWidth, kCaptureHeight, kCaptureFps, kVideoBitrateKbps, initError)) {
@@ -373,8 +361,6 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     double convertMs = 0.0;
     double encodeMs = 0.0;
     double audioMs = 0.0;
-    std::wstring lastWindowTitle;
-    std::wstring lastCaptureMethod;
     bool contentLogged = false;
     bool lastContentBlack = false;
     int hookEmptyFrames = 0;
@@ -434,37 +420,31 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         hookActive = false;
         hookEmptyFrames = 0;
         targetMissingChecks = 0;
-        lastWindowTitle.clear();
-        lastCaptureMethod.clear();
 
-        if (!newSource.empty() && _wcsicmp(newSource.c_str(), targetExecutable.c_str()) != 0) {
-            std::wstring switchError;
-            if (hook.Start(newSource, kCaptureWidth, kCaptureHeight, switchError, 3000)) {
-                targetExecutable = newSource;
-                hookActive = true;
-                rehooked = true;
-                backend = L"graphics hook (re-hooked)";
-                logLine("source: target window closed; re-hooked to " + Narrow(newSource));
-            } else {
-                logLine("source: re-hook failed: " + Narrow(switchError));
-            }
+        const bool sameTarget =
+            !newSource.empty() && _wcsicmp(newSource.c_str(), targetExecutable.c_str()) == 0;
+        if (newSource.empty() || sameTarget) {
+            error = L"The capture target closed and no other hookable window was found.";
+            logLine("source: no replacement target; stopping");
+            return false;
         }
 
-        if (!hookActive) {
-            if (!gdi.Initialize(kCaptureWidth, kCaptureHeight, initError, true, L"")) {
-                error = L"Could not capture the top-most window after the target closed: " + initError;
-                return false;
-            }
-            targetExecutable.clear();
-            hookActive = false;
-            rehooked = false;
-            backend = L"GDI (top-most window)";
-            logLine("source: capturing the top-most window with GDI");
+        std::wstring switchError;
+        if (!hook.Start(newSource, kCaptureWidth, kCaptureHeight, switchError, 3000)) {
+            error = L"The capture target closed and the next window could not be hooked: " + switchError;
+            logLine("source: re-hook failed: " + Narrow(switchError));
+            return false;
         }
+
+        targetExecutable = newSource;
+        hookActive = true;
+        rehooked = true;
+        backend = L"graphics hook";
+        logLine("source: re-hooked to " + Narrow(newSource));
 
         {
             std::lock_guard<std::mutex> lock(sourceMutex);
-            currentSource = hookActive ? targetExecutable : std::wstring();
+            currentSource = targetExecutable;
         }
 
         std::wstring encoderError;
@@ -473,8 +453,6 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
             return false;
         }
 
-        targetChangedGdi = !hookActive;
-        targetChanged = true;
         return true;
     };
 
@@ -503,28 +481,19 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         }
 
         if (hookActive && rehooked && hookEmptyFrames >= 48) {
-            logLine("source: re-hooked target stopped producing frames; switching to GDI top-most");
-            if (!switchSource(L"")) {
-                break;
-            }
+            error = L"The re-hooked capture target stopped producing frames.";
+            logLine("source: re-hooked target stopped producing frames; stopping");
+            break;
         }
 
         const auto captureStart = std::chrono::steady_clock::now();
-        if (hookActive) {
-            if (hook.Capture(frame, 20, error)) {
-                hookEmptyFrames = 0;
-            } else {
-                ++hookEmptyFrames;
-                if (hookEmptyFrames == 48) {
-                    logLine("hook: no frames for 2 s; repeating the last frame");
-                }
-            }
+        if (hook.Capture(frame, 20, error)) {
+            hookEmptyFrames = 0;
         } else {
-            if (!gdi.Capture(error)) {
-                break;
+            ++hookEmptyFrames;
+            if (hookEmptyFrames == 48) {
+                logLine("hook: no frames for 2 s; repeating the last frame");
             }
-            frame.assign(gdi.Pixels(), gdi.Pixels() + static_cast<std::size_t>(kCaptureWidth) *
-                                                       static_cast<std::size_t>(kCaptureHeight) * 4);
         }
         if (frame.size() != static_cast<std::size_t>(kCaptureWidth) * static_cast<std::size_t>(kCaptureHeight) * 4) {
             error = L"No frames are available from the capture target.";
@@ -560,28 +529,12 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
             ++framesWritten;
         }
 
-        if (!hookActive) {
-            const std::wstring capturedTitle = gdi.LastCapturedTitle();
-            if (capturedTitle != lastWindowTitle) {
-                logLine("window: " + Narrow(capturedTitle));
-                lastWindowTitle = capturedTitle;
-            }
-        }
-
         const bool contentBlack = IsMostlyBlack(frame.data(), kCaptureWidth, kCaptureHeight);
         if (!contentLogged || contentBlack != lastContentBlack) {
             logLine(contentBlack ? "content: black (capture may be missing a GPU-rendered surface)"
                                  : "content: visible");
             lastContentBlack = contentBlack;
             contentLogged = true;
-        }
-
-        if (!hookActive) {
-            const std::wstring method = gdi.LastCaptureMethod();
-            if (method != lastCaptureMethod) {
-                logLine("method: " + Narrow(method));
-                lastCaptureMethod = method;
-            }
         }
 
         if (audioEnabled && frameIndex == 0) {
@@ -644,8 +597,6 @@ struct Caster::Impl {
     std::thread thread;
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> active{false};
-    std::atomic<bool> targetChanged{false};
-    std::atomic<bool> targetChangedGdi{false};
     std::mutex sourceMutex;
     std::wstring pendingSource;
     std::atomic<bool> sourceChangeRequested{false};
@@ -746,15 +697,6 @@ bool Caster::ChangeSource(const std::wstring& targetExecutable, std::wstring& er
     return true;
 }
 
-bool Caster::TakeTargetChanged(bool& usedGdi)
-{
-    if (!impl_ || !impl_->targetChanged.exchange(false)) {
-        return false;
-    }
-    usedGdi = impl_->targetChangedGdi.load();
-    return true;
-}
-
 std::wstring Caster::Source() const
 {
     if (!impl_) {
@@ -790,35 +732,147 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         OutputDebugStringW((L"wxr-vid-cap cast: " + line + L"\n").c_str());
     };
 
-    ScreenCapture gdi;
-    HookCapture hook;
-    bool hookActive = false;
+    std::unique_ptr<HookCapture> hook;
     std::wstring initError;
-
-    if (!targetExecutable.empty()) {
-        if (hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, initError, hookTimeoutMs)) {
-            hookActive = true;
-            backend = L"graphics hook";
-            trace(L"backend: graphics hook, " + hook.LastInjectionMethod() + L", source " +
-                  std::to_wstring(hook.SourceWidth()) + L"x" + std::to_wstring(hook.SourceHeight()) +
-                  L", pid " + std::to_wstring(hook.ProcessId()));
-        } else {
-            trace(L"hook unavailable; falling back to GDI: " + initError);
-            initError.clear();
-        }
+    std::wstring desiredTarget = targetExecutable;
+    if (!desiredTarget.empty() && IsExcludedExecutablePath(desiredTarget)) {
+        trace(L"source: saved target is blacklisted; using top-most retries: " + desiredTarget);
+        desiredTarget.clear();
     }
 
-    if (!hookActive && !gdi.Initialize(kCaptureWidth, kCaptureHeight, initError, true, targetExecutable)) {
-        fail(L"Could not start screen capture: " + initError);
-        return;
-    }
-    if (!hookActive) {
-        backend = L"GDI (top-most window)";
-        trace(L"backend: GDI (top-most window)");
-    }
+    bool hookActive = false;
+    bool resetEncoder = false;
+    int hookEmptyFrames = 0;
+    int targetMissingChecks = 0;
+    ULONGLONG nextRetry = GetTickCount64() + 1000;
+    std::vector<std::uint8_t> frame;
+    const std::size_t frameBytes =
+        static_cast<std::size_t>(kCaptureWidth) * static_cast<std::size_t>(kCaptureHeight) * 4;
+    std::vector<std::uint8_t> blankFrame(frameBytes, 0);
+
+    std::mutex retryMutex;
+    std::unique_ptr<HookCapture> pendingHook;
+    std::wstring pendingTarget;
+    std::atomic<bool> retryInProgress{false};
+    std::atomic<bool> retryFinished{false};
+    std::atomic<bool> retrySucceeded{false};
+    std::atomic<unsigned> retryGeneration{0};
+    std::atomic<unsigned> retryResultGeneration{0};
+    std::thread retryThread;
+
     {
         std::lock_guard<std::mutex> lock(sourceMutex);
-        currentSource = hookActive ? targetExecutable : std::wstring();
+        currentSource.clear();
+    }
+
+    auto tryHookSource = [&](const std::wstring& candidate, int timeoutMs) -> bool {
+        if (candidate.empty() || IsExcludedExecutablePath(candidate)) {
+            return false;
+        }
+        if (hookActive && hook) {
+            hook->Stop();
+            hook.reset();
+            hookActive = false;
+        }
+        if (!hook) {
+            hook = std::make_unique<HookCapture>();
+        }
+
+        std::wstring switchError;
+        if (!hook->Start(candidate, kCaptureWidth, kCaptureHeight, switchError, timeoutMs)) {
+            trace(L"source: hook failed for " + candidate + L": " + switchError);
+            return false;
+        }
+
+        targetExecutable = candidate;
+        hookActive = true;
+        resetEncoder = true;
+        hookEmptyFrames = 0;
+        targetMissingChecks = 0;
+        frame.clear();
+        backend = L"graphics hook";
+        {
+            std::lock_guard<std::mutex> lock(sourceMutex);
+            currentSource = candidate;
+        }
+        trace(L"source: hooked " + candidate + L", " + hook->LastInjectionMethod() + L", source " +
+              std::to_wstring(hook->SourceWidth()) + L"x" + std::to_wstring(hook->SourceHeight()) +
+              L", pid " + std::to_wstring(hook->ProcessId()));
+        return true;
+    };
+
+    auto enterWaiting = [&]() {
+        if (hook) {
+            hook->Stop();
+            hook.reset();
+        }
+        hookActive = false;
+        hookEmptyFrames = 0;
+        targetMissingChecks = 0;
+        desiredTarget.clear();
+        resetEncoder = true;
+        nextRetry = GetTickCount64();
+        frame.clear();
+        {
+            std::lock_guard<std::mutex> lock(sourceMutex);
+            currentSource.clear();
+        }
+        trace(L"source: waiting for a capturable window; sending blank frames");
+    };
+
+    auto startRetry = [&](const std::wstring& candidate) {
+        if (retryInProgress.load()) {
+            return;
+        }
+        if (retryThread.joinable()) {
+            retryThread.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(retryMutex);
+            pendingHook.reset();
+            pendingTarget.clear();
+        }
+
+        const unsigned generation = ++retryGeneration;
+        retrySucceeded = false;
+        retryFinished = false;
+        retryInProgress = true;
+        nextRetry = GetTickCount64() + kSourceRetryIntervalMs;
+
+        retryThread = std::thread([&, candidate, generation]() {
+            auto candidateHook = std::make_unique<HookCapture>();
+            std::wstring retryError;
+            const bool ok = candidateHook->Start(candidate, kCaptureWidth, kCaptureHeight, retryError,
+                                                 kHookRetryTimeoutMs);
+            if (ok) {
+                std::lock_guard<std::mutex> lock(retryMutex);
+                pendingHook = std::move(candidateHook);
+                pendingTarget = candidate;
+            } else {
+                OutputDebugStringW((L"wxr-vid-cap cast: source retry failed for " + candidate + L": " +
+                                    retryError + L"\n").c_str());
+            }
+            retryResultGeneration = generation;
+            retrySucceeded = ok;
+            retryFinished = true;
+            retryInProgress = false;
+        });
+    };
+
+    // Start with the requested source, then fall back to the current top-most window.
+    if (!desiredTarget.empty()) {
+        if (!tryHookSource(desiredTarget, hookTimeoutMs)) {
+            desiredTarget.clear();
+        }
+    }
+    if (!hookActive) {
+        const std::wstring top = TopMostWindowExecutable();
+        if (!top.empty()) {
+            tryHookSource(top, kHookRetryTimeoutMs);
+        }
+    }
+    if (!hookActive) {
+        trace(L"source: no capturable window at startup; sending blank frames and retrying");
     }
 
     H264Encoder encoder;
@@ -830,132 +884,101 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     AudioCapture audio;
     OpusAudioEncoder opus;
     AudioResampler resampler;
-    bool audioEnabled = false;
-    if (audio.Initialize(initError) && opus.Initialize(48000, audio.Channels(), kAudioBitrate, initError) &&
-        audio.Start(initError)) {
-        resampler.Initialize(audio.SampleRate(), audio.Channels(), 48000);
-        audioEnabled = true;
+    bool audioCaptureEnabled = false;
+    int audioChannels = 2;
+    if (audio.Initialize(initError) && audio.Start(initError)) {
+        audioChannels = audio.Channels();
+        resampler.Initialize(audio.SampleRate(), audioChannels, 48000);
+        audioCaptureEnabled = true;
         trace(L"audio: capture " + std::to_wstring(audio.SampleRate()) + L" Hz -> 48000 Hz, " +
-              std::to_wstring(audio.Channels()) + L" ch, 96 kbps");
+              std::to_wstring(audioChannels) + L" ch, 96 kbps");
     } else {
-        trace(L"audio unavailable; video-only: " + initError);
+        trace(L"audio capture unavailable; casting silent audio: " + initError);
         audio.Shutdown();
-        opus.Shutdown();
         initError.clear();
     }
 
+    if (!opus.Initialize(48000, audioChannels, kAudioBitrate, initError)) {
+        fail(L"Could not start the audio encoder: " + initError);
+        return;
+    }
+
     UdpTsSink sink(sender);
-    TsMuxer muxer(sink, audioEnabled ? TsAudioCodec::Opus : TsAudioCodec::None,
-                  audioEnabled ? audio.Channels() : 0);
+    TsMuxer muxer(sink, TsAudioCodec::Opus, audioChannels);
 
     active = true;
     announced = true;
     ready.set_value({true, L""});
-    trace(L"target: " + (targetExecutable.empty() ? std::wstring(L"top-most window") : targetExecutable) +
+    trace(L"target: " + (hookActive ? targetExecutable : std::wstring(L"waiting for a source")) +
           L", viewer udp://@:" + std::to_wstring(port));
 
     const int64_t frameTicks = 90000 / kCaptureFps;
     const auto start = std::chrono::steady_clock::now();
     int frameIndex = 0;
     int framesSent = 0;
-    int hookEmptyFrames = 0;
-    int targetMissingChecks = 0;
-    bool rehooked = false;
-    bool rehookWasAutomatic = false;
-    std::vector<std::uint8_t> frame;
 
-    const int audioChannels = audioEnabled ? audio.Channels() : 0;
-    const int audioRate = audioEnabled ? opus.SampleRate() : 0;
-    const int opusFrameSamples = audioEnabled ? opus.FrameSamples() : 0;
+    const int audioRate = 48000;
+    const int opusFrameSamples = opus.FrameSamples();
     std::vector<std::int16_t> audioBuffer;
     std::size_t audioOffset = 0;
     std::int64_t audioSamplesEncoded = 0;
+    std::vector<std::int16_t> silence(
+        static_cast<std::size_t>(opusFrameSamples) * static_cast<std::size_t>(audioChannels), 0);
 
-    auto drainAudio = [&](std::int64_t upToPts) -> bool {
-        std::vector<std::int16_t> captured;
-        if (!audio.Read(captured, error)) {
-            return false;
+    auto drainAudio = [&](std::int64_t upToPts, bool silenceMode) -> bool {
+        if (!silenceMode && audioCaptureEnabled) {
+            std::vector<std::int16_t> captured;
+            if (!audio.Read(captured, error)) {
+                return false;
+            }
+            std::vector<std::int16_t> resampled;
+            resampler.Process(captured, resampled);
+            audioBuffer.insert(audioBuffer.end(), resampled.begin(), resampled.end());
+
+            for (;;) {
+                const std::size_t availableSamples =
+                    (audioBuffer.size() - audioOffset) / static_cast<std::size_t>(audioChannels);
+                if (availableSamples < static_cast<std::size_t>(opusFrameSamples)) {
+                    break;
+                }
+                const std::int64_t pts = audioSamplesEncoded * 90000 / audioRate;
+                if (pts > upToPts) {
+                    break;
+                }
+
+                std::vector<std::uint8_t> packet;
+                if (!opus.Encode(audioBuffer.data() + audioOffset, opusFrameSamples, packet, error)) {
+                    return false;
+                }
+                muxer.WriteAudio(packet.data(), packet.size(), pts);
+                audioOffset += static_cast<std::size_t>(opusFrameSamples) *
+                               static_cast<std::size_t>(audioChannels);
+                audioSamplesEncoded += opusFrameSamples;
+            }
+
+            if (audioOffset > 0 && audioOffset >= 48000u * static_cast<std::size_t>(audioChannels)) {
+                audioBuffer.erase(audioBuffer.begin(),
+                                  audioBuffer.begin() + static_cast<std::ptrdiff_t>(audioOffset));
+                audioOffset = 0;
+            }
+            return true;
         }
-        std::vector<std::int16_t> resampled;
-        resampler.Process(captured, resampled);
-        audioBuffer.insert(audioBuffer.end(), resampled.begin(), resampled.end());
 
-        for (;;) {
-            const std::size_t availableSamples =
-                (audioBuffer.size() - audioOffset) / static_cast<std::size_t>(audioChannels);
-            if (availableSamples < static_cast<std::size_t>(opusFrameSamples)) {
-                break;
+        // Silent audio while waiting for a source, or when audio capture is unavailable.
+        if (audioCaptureEnabled) {
+            std::vector<std::int16_t> discard;
+            if (!audio.Read(discard, error)) {
+                return false;
             }
+        }
+        while (opusFrameSamples > 0 && audioSamplesEncoded * 90000 / audioRate <= upToPts) {
             const std::int64_t pts = audioSamplesEncoded * 90000 / audioRate;
-            if (pts > upToPts) {
-                break;
-            }
-
             std::vector<std::uint8_t> packet;
-            if (!opus.Encode(audioBuffer.data() + audioOffset, opusFrameSamples, packet, error)) {
+            if (!opus.Encode(silence.data(), opusFrameSamples, packet, error)) {
                 return false;
             }
             muxer.WriteAudio(packet.data(), packet.size(), pts);
-
-            audioOffset += static_cast<std::size_t>(opusFrameSamples) * static_cast<std::size_t>(audioChannels);
             audioSamplesEncoded += opusFrameSamples;
-        }
-
-        if (audioOffset > 0 && audioOffset >= 48000u * static_cast<std::size_t>(audioChannels)) {
-            audioBuffer.erase(audioBuffer.begin(), audioBuffer.begin() + static_cast<std::ptrdiff_t>(audioOffset));
-            audioOffset = 0;
-        }
-        return true;
-    };
-
-    auto switchSource = [&](const std::wstring& newSource, bool automatic) -> bool {
-        hook.Stop();
-        hookActive = false;
-        hookEmptyFrames = 0;
-        targetMissingChecks = 0;
-
-        const bool sameTarget =
-            !newSource.empty() && _wcsicmp(newSource.c_str(), targetExecutable.c_str()) == 0;
-        if (!newSource.empty() && (!sameTarget || !automatic)) {
-            std::wstring switchError;
-            if (hook.Start(newSource, kCaptureWidth, kCaptureHeight, switchError, 3000)) {
-                targetExecutable = newSource;
-                hookActive = true;
-                rehooked = true;
-                rehookWasAutomatic = automatic;
-                backend = L"graphics hook";
-                trace(L"source: re-hooked to " + newSource);
-            } else {
-                trace(L"source: re-hook failed: " + switchError);
-            }
-        }
-
-        if (!hookActive) {
-            if (!gdi.Initialize(kCaptureWidth, kCaptureHeight, initError, true, L"")) {
-                error = L"Could not capture the top-most window after switching sources: " + initError;
-                return false;
-            }
-            targetExecutable.clear();
-            hookActive = false;
-            rehooked = false;
-            backend = L"GDI (top-most window)";
-            trace(L"source: capturing the top-most window with GDI");
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(sourceMutex);
-            currentSource = hookActive ? targetExecutable : std::wstring();
-        }
-
-        std::wstring encoderError;
-        if (!encoder.Initialize(kCaptureWidth, kCaptureHeight, kCaptureFps, kVideoBitrateKbps, encoderError)) {
-            error = L"Could not restart the video encoder after switching sources: " + encoderError;
-            return false;
-        }
-
-        if (automatic) {
-            targetChangedGdi = !hookActive;
-            targetChanged = true;
         }
         return true;
     };
@@ -963,8 +986,8 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     while (!stopRequested.load()) {
         const std::int64_t pts = static_cast<std::int64_t>(frameIndex) * frameTicks;
 
-        if (audioEnabled && frameIndex > 0) {
-            if (!drainAudio(pts)) {
+        if (frameIndex > 0) {
+            if (!drainAudio(pts, !hookActive || !audioCaptureEnabled)) {
                 break;
             }
         }
@@ -975,54 +998,149 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
                 std::lock_guard<std::mutex> lock(sourceMutex);
                 newSource = pendingSource;
             }
-            if (!switchSource(newSource, false)) {
-                break;
+            if (hookActive) {
+                if (hook) {
+                    hook->Stop();
+                    hook.reset();
+                }
+                hookActive = false;
             }
+            ++retryGeneration;
+            targetExecutable.clear();
+            desiredTarget = newSource;
+            if (!desiredTarget.empty() && IsExcludedExecutablePath(desiredTarget)) {
+                desiredTarget.clear();
+            }
+            resetEncoder = true;
+            hookEmptyFrames = 0;
+            targetMissingChecks = 0;
+            nextRetry = GetTickCount64();
+            frame.clear();
+            {
+                std::lock_guard<std::mutex> lock(sourceMutex);
+                currentSource.clear();
+            }
+            trace(L"source: manual source change requested");
         }
 
         if (hookActive && !targetExecutable.empty() && frameIndex > 0 &&
             frameIndex % kCaptureFps == 0 && hookEmptyFrames > 0) {
-            if (TargetStillPresent(targetExecutable, hook.ProcessId())) {
+            if (TargetStillPresent(targetExecutable, hook->ProcessId())) {
                 targetMissingChecks = 0;
-            } else if (++targetMissingChecks >= 3) {
-                if (!switchSource(TopMostWindowExecutable(), true)) {
-                    break;
-                }
+            } else if (++targetMissingChecks >= kTargetMissingLimit) {
+                enterWaiting();
             }
         } else if (hookEmptyFrames == 0) {
             targetMissingChecks = 0;
         }
 
-        if (hookActive && rehooked && hookEmptyFrames >= 48) {
-            trace(L"source: re-hooked target stopped producing frames; switching to GDI top-most");
-            if (!switchSource(L"", rehookWasAutomatic)) {
-                break;
+        if (hookActive && hookEmptyFrames >= kHookStallFrames) {
+            trace(L"hook: no frames for 5 s; dropping source and retrying");
+            enterWaiting();
+        }
+
+        if (retryFinished.exchange(false)) {
+            if (retryThread.joinable()) {
+                retryThread.join();
+            }
+
+            std::unique_ptr<HookCapture> newHook;
+            std::wstring newTarget;
+            {
+                std::lock_guard<std::mutex> lock(retryMutex);
+                newHook = std::move(pendingHook);
+                newTarget = pendingTarget;
+                pendingTarget.clear();
+            }
+
+            const unsigned resultGeneration = retryResultGeneration.load();
+            const unsigned currentGeneration = retryGeneration.load();
+            if (resultGeneration != currentGeneration) {
+                // A manual source change happened while this probe was running.
+                if (newHook) {
+                    newHook->Stop();
+                    newHook.reset();
+                }
+                nextRetry = GetTickCount64();
+            } else if (retrySucceeded.load() && newHook != nullptr) {
+                if (hook) {
+                    hook->Stop();
+                    hook.reset();
+                }
+                hook = std::move(newHook);
+                targetExecutable = newTarget;
+                hookActive = true;
+                resetEncoder = true;
+                hookEmptyFrames = 0;
+                targetMissingChecks = 0;
+                frame.clear();
+                backend = L"graphics hook";
+                {
+                    std::lock_guard<std::mutex> lock(sourceMutex);
+                    currentSource = targetExecutable;
+                }
+                trace(L"source: hooked " + targetExecutable + L" after retry");
+            } else {
+                if (newHook) {
+                    newHook->Stop();
+                    newHook.reset();
+                }
+                if (!desiredTarget.empty()) {
+                    trace(L"source: selected target unavailable; falling back to top-most retries");
+                    desiredTarget.clear();
+                }
+                nextRetry = GetTickCount64() + kSourceRetryIntervalMs;
             }
         }
 
-        if (hookActive) {
-            if (hook.Capture(frame, 20, error)) {
+        if (!hookActive && !retryInProgress.load() && GetTickCount64() >= nextRetry) {
+            std::wstring candidate = desiredTarget;
+            if (candidate.empty() || IsExcludedExecutablePath(candidate)) {
+                if (!candidate.empty()) {
+                    trace(L"source: selected target is blacklisted; using top-most retries");
+                    desiredTarget.clear();
+                }
+                candidate = TopMostWindowExecutable();
+            }
+            if (!candidate.empty()) {
+                startRetry(candidate);
+            } else {
+                nextRetry = GetTickCount64() + kSourceRetryIntervalMs;
+            }
+        }
+
+        if (resetEncoder) {
+            std::wstring encoderError;
+            if (!encoder.Initialize(kCaptureWidth, kCaptureHeight, kCaptureFps, kVideoBitrateKbps, encoderError)) {
+                error = L"Could not restart the video encoder after switching sources: " + encoderError;
+                break;
+            }
+            resetEncoder = false;
+        }
+
+        const std::vector<std::uint8_t>* sourceFrame = &blankFrame;
+        if (hookActive && hook) {
+            if (hook->Capture(frame, 20, error)) {
                 hookEmptyFrames = 0;
+                sourceFrame = &frame;
             } else {
                 ++hookEmptyFrames;
                 if (hookEmptyFrames == 48) {
                     trace(L"hook: no frames for 2 s; repeating the last frame");
                 }
+                if (!frame.empty()) {
+                    sourceFrame = &frame;
+                }
             }
-        } else {
-            if (!gdi.Capture(error)) {
-                break;
-            }
-            frame.assign(gdi.Pixels(), gdi.Pixels() + static_cast<std::size_t>(kCaptureWidth) *
-                                                       static_cast<std::size_t>(kCaptureHeight) * 4);
         }
-        if (frame.size() != static_cast<std::size_t>(kCaptureWidth) * static_cast<std::size_t>(kCaptureHeight) * 4) {
+
+        if (sourceFrame->size() != frameBytes) {
             error = L"No frames are available from the capture target.";
             break;
         }
 
         std::vector<std::uint8_t> i420;
-        if (!BgraToI420(frame.data(), kCaptureWidth, kCaptureHeight, i420)) {
+        if (!BgraToI420(sourceFrame->data(), kCaptureWidth, kCaptureHeight, i420)) {
             error = L"Frame conversion failed.";
             break;
         }
@@ -1037,8 +1155,8 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
             ++framesSent;
         }
 
-        if (audioEnabled && frameIndex == 0) {
-            if (!drainAudio(0)) {
+        if (frameIndex == 0) {
+            if (!drainAudio(0, !hookActive || !audioCaptureEnabled)) {
                 break;
             }
         }
@@ -1049,11 +1167,18 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         std::this_thread::sleep_until(deadline);
     }
 
-    if (audioEnabled) {
-        if (error.empty()) {
-            drainAudio(std::numeric_limits<std::int64_t>::max());
-        }
+    if (error.empty()) {
+        drainAudio(std::numeric_limits<std::int64_t>::max(), !hookActive || !audioCaptureEnabled);
+    }
+    if (audioCaptureEnabled) {
         audio.Stop();
+    }
+    if (retryThread.joinable()) {
+        retryThread.join();
+    }
+    if (pendingHook) {
+        pendingHook->Stop();
+        pendingHook.reset();
     }
     sink.Flush();
 

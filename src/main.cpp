@@ -24,6 +24,7 @@
 #pragma comment(lib, "winmm.lib")
 
 #include "hook_capture.h"
+#include "exclusions.h"
 #include "injection.h"
 #include "process_list.h"
 #include "resource.h"
@@ -83,7 +84,7 @@ HWND DialogOwner();
 
 std::vector<std::uint8_t> g_recordStartSound;
 std::vector<std::uint8_t> g_recordStopSound;
-std::vector<std::uint8_t> g_gdiFallbackSound;
+std::vector<std::uint8_t> g_hookFailureSound;
 
 // Builds a short 16-bit mono WAV. Notes are (frequencyHz, durationMs); frequency 0 is silence.
 void BuildBeepWav(std::vector<std::uint8_t>& wav, const std::vector<std::pair<double, int>>& notes,
@@ -200,13 +201,13 @@ void PlayRecordingStopSound(bool synchronous = false)
     PlayBeep(g_recordStopSound, synchronous);
 }
 
-void PlayGdiFallbackSound()
+void PlayHookFailureSound()
 {
-    if (g_gdiFallbackSound.empty()) {
-        // Two short low "dun dun" beeps: capture fell back to GDI instead of the hook.
-        BuildBeepWav(g_gdiFallbackSound, {{220.0, 100}, {0.0, 40}, {165.0, 140}}, 0.16);
+    if (g_hookFailureSound.empty()) {
+        // Two short low "dun dun" beeps: the graphics hook could not start.
+        BuildBeepWav(g_hookFailureSound, {{220.0, 100}, {0.0, 40}, {165.0, 140}}, 0.16);
     }
-    PlayBeep(g_gdiFallbackSound, false);
+    PlayBeep(g_hookFailureSound, false);
 }
 
 std::wstring Trim(std::wstring text)
@@ -269,7 +270,7 @@ void UpdateMainWindow()
     case SessionMode::Casting: {
         const ULONGLONG elapsedSeconds = (GetTickCount64() - g_app.recordingStart) / 1000;
         const std::wstring source = g_app.caster.Source();
-        const std::wstring sourceName = source.empty() ? L"top-most window" : FileNameOf(source);
+        const std::wstring sourceName = source.empty() ? L"waiting for a source" : FileNameOf(source);
         wchar_t buffer[256] = {};
         swprintf_s(buffer, L"Casting %02llu:%02llu to %s\nSource: %s", elapsedSeconds / 60,
                    elapsedSeconds % 60, g_app.settings.receiverIp.c_str(), sourceName.c_str());
@@ -378,20 +379,36 @@ std::wstring DefaultRecordingName()
     GetLocalTime(&now);
 
     wchar_t name[64] = {};
-    swprintf_s(name, L"recording_%04u-%02u-%02u_%02u%02u%02u.mkv", now.wYear, now.wMonth, now.wDay, now.wHour,
-               now.wMinute, now.wSecond);
+    swprintf_s(name, L"capture_%04u-%02u-%02u_%02u_%02u_%02u.mkv", now.wYear, now.wMonth, now.wDay,
+               now.wHour, now.wMinute, now.wSecond);
     return name;
 }
 
-// D:\ is the Android host's Downloads directory inside Winlator. The mapping is fork-specific,
-// so fall back to whatever directory the Save dialog last used when it is missing.
+// D:\ is the Android host's Downloads directory inside Winlator. Record into D:\WXRVIDCAP by
+// default, creating it if needed; fall back to Videos or the app directory when D:\ is missing.
 std::wstring DefaultRecordingDirectory()
 {
-    const DWORD attributes = GetFileAttributesW(L"D:\\");
-    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-        return L"D:\\";
+    const DWORD root = GetFileAttributesW(L"D:\\");
+    if (root != INVALID_FILE_ATTRIBUTES && (root & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        const std::wstring directory = L"D:\\WXRVIDCAP";
+        if (CreateDirectoryW(directory.c_str(), nullptr) != FALSE || GetLastError() == ERROR_ALREADY_EXISTS) {
+            return directory;
+        }
     }
-    return std::wstring();
+
+    wchar_t profile[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH) > 0) {
+        const std::wstring directory = std::wstring(profile) + L"\\Videos\\WXRVIDCAP";
+        if (CreateDirectoryW(directory.c_str(), nullptr) != FALSE || GetLastError() == ERROR_ALREADY_EXISTS) {
+            return directory;
+        }
+    }
+
+    const std::wstring fallback = ExecutableDirectory() + L"\\recordings";
+    if (CreateDirectoryW(fallback.c_str(), nullptr) != FALSE || GetLastError() == ERROR_ALREADY_EXISTS) {
+        return fallback;
+    }
+    return ExecutableDirectory();
 }
 
 void ShowBalloon(const wchar_t* title, const wchar_t* text, DWORD flags)
@@ -467,6 +484,72 @@ void RemoveTrayIcon()
     Shell_NotifyIconW(NIM_DELETE, &data);
 }
 
+std::wstring GetIpEditText(HWND dialog)
+{
+    wchar_t buffer[64] = {};
+    GetDlgItemTextW(dialog, IDC_IP_EDIT, buffer, ARRAYSIZE(buffer));
+    return buffer;
+}
+
+void SetIpEditText(HWND dialog, const std::wstring& text, int caret)
+{
+    SetDlgItemTextW(dialog, IDC_IP_EDIT, text.c_str());
+    SendDlgItemMessageW(dialog, IDC_IP_EDIT, EM_SETSEL, static_cast<WPARAM>(caret),
+                        static_cast<LPARAM>(caret));
+    SetFocus(GetDlgItem(dialog, IDC_IP_EDIT));
+}
+
+void InsertIpCharacter(HWND dialog, wchar_t character)
+{
+    std::wstring text = GetIpEditText(dialog);
+    const DWORD selection = static_cast<DWORD>(SendDlgItemMessageW(dialog, IDC_IP_EDIT, EM_GETSEL, 0, 0));
+    int start = LOWORD(selection);
+    int end = HIWORD(selection);
+    if (start > static_cast<int>(text.size())) {
+        start = static_cast<int>(text.size());
+    }
+    if (end > static_cast<int>(text.size())) {
+        end = static_cast<int>(text.size());
+    }
+    if (end < start) {
+        std::swap(start, end);
+    }
+
+    const std::size_t removed = static_cast<std::size_t>(end - start);
+    if (text.size() - removed >= 15) {
+        return;
+    }
+
+    text.replace(static_cast<std::size_t>(start), removed, 1, character);
+    SetIpEditText(dialog, text, start + 1);
+}
+
+void BackspaceIpCharacter(HWND dialog)
+{
+    std::wstring text = GetIpEditText(dialog);
+    const DWORD selection = static_cast<DWORD>(SendDlgItemMessageW(dialog, IDC_IP_EDIT, EM_GETSEL, 0, 0));
+    int start = LOWORD(selection);
+    int end = HIWORD(selection);
+    if (start > static_cast<int>(text.size())) {
+        start = static_cast<int>(text.size());
+    }
+    if (end > static_cast<int>(text.size())) {
+        end = static_cast<int>(text.size());
+    }
+    if (end < start) {
+        std::swap(start, end);
+    }
+
+    if (start == end) {
+        if (start == 0) {
+            return;
+        }
+        --start;
+    }
+    text.erase(static_cast<std::size_t>(start), static_cast<std::size_t>(end - start));
+    SetIpEditText(dialog, text, start);
+}
+
 INT_PTR CALLBACK ReceiverIpDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message) {
@@ -474,8 +557,20 @@ INT_PTR CALLBACK ReceiverIpDialogProc(HWND dialog, UINT message, WPARAM wParam, 
         auto* value = reinterpret_cast<std::wstring*>(lParam);
         SetWindowLongPtrW(dialog, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(value));
         ApplyDialogIcon(dialog);
-        SetDlgItemTextW(dialog, IDC_IP_EDIT, value != nullptr ? value->c_str() : L"");
-        SendDlgItemMessageW(dialog, IDC_IP_EDIT, EM_SETSEL, 0, static_cast<LPARAM>(-1));
+
+        std::wstring initial = (value != nullptr) ? *value : std::wstring();
+        const bool usedDefault = initial.empty();
+        if (usedDefault) {
+            initial = L"192.168.0.";
+        }
+        SetDlgItemTextW(dialog, IDC_IP_EDIT, initial.c_str());
+        if (usedDefault) {
+            const int caret = static_cast<int>(initial.size());
+            SendDlgItemMessageW(dialog, IDC_IP_EDIT, EM_SETSEL, static_cast<WPARAM>(caret),
+                                static_cast<LPARAM>(caret));
+        } else {
+            SendDlgItemMessageW(dialog, IDC_IP_EDIT, EM_SETSEL, 0, static_cast<LPARAM>(-1));
+        }
         SetFocus(GetDlgItem(dialog, IDC_IP_EDIT));
         return FALSE;
     }
@@ -504,8 +599,21 @@ INT_PTR CALLBACK ReceiverIpDialogProc(HWND dialog, UINT message, WPARAM wParam, 
             EndDialog(dialog, IDCANCEL);
             return TRUE;
         default:
-            return FALSE;
+            break;
         }
+
+        if (LOWORD(wParam) >= IDC_IP_KEY_0 && LOWORD(wParam) <= IDC_IP_KEY_BACK) {
+            const UINT key = LOWORD(wParam);
+            if (key == IDC_IP_KEY_BACK) {
+                BackspaceIpCharacter(dialog);
+            } else if (key == IDC_IP_KEY_DOT) {
+                InsertIpCharacter(dialog, L'.');
+            } else {
+                InsertIpCharacter(dialog, static_cast<wchar_t>(L'0' + (key - IDC_IP_KEY_0)));
+            }
+            return TRUE;
+        }
+        return FALSE;
     default:
         return FALSE;
     }
@@ -748,6 +856,12 @@ INT_PTR CALLBACK CaptureSourceDialogProc(HWND dialog, UINT message, WPARAM wPara
                 }
                 context->source->kind = CaptureSource::Kind::Running;
                 context->source->executable = context->windows[static_cast<std::size_t>(item)].executablePath;
+                if (IsExcludedExecutablePath(context->source->executable)) {
+                    const std::wstring blocked =
+                        L"That application is on the capture blacklist:\n" + context->source->executable;
+                    MessageBoxW(dialog, blocked.c_str(), L"wxr-vid-cap", MB_OK | MB_ICONWARNING);
+                    return TRUE;
+                }
                 context->settings->captureTargetExe = context->source->executable;
             } else {
                 wchar_t current[MAX_PATH * 4] = {};
@@ -762,6 +876,12 @@ INT_PTR CALLBACK CaptureSourceDialogProc(HWND dialog, UINT message, WPARAM wPara
                 if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
                     MessageBoxW(dialog, L"The selected application could not be found.", L"wxr-vid-cap",
                                 MB_OK | MB_ICONWARNING);
+                    return TRUE;
+                }
+                if (IsExcludedExecutablePath(path)) {
+                    const std::wstring blocked =
+                        L"That application is on the capture blacklist:\n" + path;
+                    MessageBoxW(dialog, blocked.c_str(), L"wxr-vid-cap", MB_OK | MB_ICONWARNING);
                     return TRUE;
                 }
                 context->source->kind = CaptureSource::Kind::Launch;
@@ -856,7 +976,7 @@ void HookAndRecordDebug()
     HookCapture hook;
     std::wstring error;
     if (!hook.Start(g_app.settings.captureTargetExe, 1280, 720, error)) {
-        PlayGdiFallbackSound();
+        PlayHookFailureSound();
         MessageBoxW(g_app.window, error.c_str(), L"HOOK AND RECORD (debug)", MB_OK | MB_ICONERROR);
         return;
     }
@@ -930,6 +1050,10 @@ bool RunLauncher(const std::wstring& launcher, const std::wstring& target, std::
 
 bool LaunchTargetWithHook(const std::wstring& path, std::wstring& error)
 {
+    if (IsExcludedExecutablePath(path)) {
+        error = L"That application is blacklisted from capture: " + path;
+        return false;
+    }
     if (FindProcessByExecutable(path) != 0) {
         error = L"That application is already running.\n\n"
                 L"Close it first, or choose \"Capture a running application\".";
@@ -1008,7 +1132,7 @@ void BeginRecordLocal()
                     (L"Launching " + FileNameOf(source.executable) + L" with the capture hook.").c_str(), NIIF_INFO);
         std::wstring launchError;
         if (!LaunchTargetWithHook(source.executable, launchError)) {
-            PlayGdiFallbackSound();
+            PlayHookFailureSound();
             MessageBoxW(DialogOwner(), launchError.c_str(), L"wxr-vid-cap", MB_OK | MB_ICONERROR);
             return;
         }
@@ -1019,6 +1143,7 @@ void BeginRecordLocal()
     std::wstring error;
     const int hookTimeout = (source.kind == CaptureSource::Kind::Launch) ? kLaunchHookTimeoutMs : 6000;
     if (!g_app.recorder.Start(path, source.executable, error, hookTimeout)) {
+        PlayHookFailureSound();
         MessageBoxW(DialogOwner(), (L"Could not start recording.\n\n" + error).c_str(), L"wxr-vid-cap",
                     MB_OK | MB_ICONERROR);
         return;
@@ -1029,9 +1154,6 @@ void BeginRecordLocal()
     SetTimer(g_app.window, kSessionTimerId, 1000, nullptr);
     UpdateTrayTip();
     UpdateMainWindow();
-    if (g_app.recorder.Backend().find(L"GDI") != std::wstring::npos) {
-        PlayGdiFallbackSound();
-    }
     const std::wstring detail = L"Saving to:\n" + path + L"\nCapture: " + g_app.recorder.Backend();
     ShowBalloon(L"Recording started", detail.c_str(), NIIF_INFO);
 }
@@ -1057,7 +1179,7 @@ void BeginCastLocal()
                     (L"Launching " + FileNameOf(source.executable) + L" with the capture hook.").c_str(), NIIF_INFO);
         std::wstring launchError;
         if (!LaunchTargetWithHook(source.executable, launchError)) {
-            PlayGdiFallbackSound();
+            PlayHookFailureSound();
             MessageBoxW(DialogOwner(), launchError.c_str(), L"wxr-vid-cap", MB_OK | MB_ICONERROR);
             return;
         }
@@ -1069,6 +1191,7 @@ void BeginCastLocal()
     const int hookTimeout = (source.kind == CaptureSource::Kind::Launch) ? kLaunchHookTimeoutMs : 6000;
     if (!g_app.caster.Start(g_app.settings.receiverIp, g_app.settings.port, source.executable, error,
                             hookTimeout)) {
+        PlayHookFailureSound();
         MessageBoxW(DialogOwner(), (L"Could not start casting.\n\n" + error).c_str(), L"wxr-vid-cap",
                     MB_OK | MB_ICONERROR);
         return;
@@ -1079,14 +1202,14 @@ void BeginCastLocal()
     SetTimer(g_app.window, kSessionTimerId, 1000, nullptr);
     UpdateTrayTip();
     UpdateMainWindow();
-    if (g_app.caster.Backend().find(L"GDI") != std::wstring::npos) {
-        PlayGdiFallbackSound();
-    }
 
+    const std::wstring castSource = g_app.caster.Source();
+    const std::wstring capture =
+        castSource.empty() ? L"waiting for a source (blank video + silent audio)"
+                           : (L"graphics hook: " + FileNameOf(castSource));
     const std::wstring message = L"Sending live to " + g_app.settings.receiverIp + L".\n\nOpen " +
                                  g_app.caster.ViewerUrl() +
-                                 L" in VLC on the receiver. It can join at any time.\nCapture: " +
-                                 g_app.caster.Backend();
+                                 L" in VLC on the receiver. It can join at any time.\nCapture: " + capture;
     ShowBalloon(L"Casting", message.c_str(), NIIF_INFO);
 }
 
@@ -1106,7 +1229,7 @@ void BeginSelectCastSource()
                     (L"Launching " + FileNameOf(source.executable) + L" with the capture hook.").c_str(), NIIF_INFO);
         std::wstring launchError;
         if (!LaunchTargetWithHook(source.executable, launchError)) {
-            PlayGdiFallbackSound();
+            PlayHookFailureSound();
             MessageBoxW(DialogOwner(), launchError.c_str(), L"wxr-vid-cap", MB_OK | MB_ICONERROR);
             return;
         }
@@ -1118,7 +1241,6 @@ void BeginSelectCastSource()
                     MB_OK | MB_ICONERROR);
         return;
     }
-    ShowBalloon(L"Cast source", L"Switching the cast to the selected source.", NIIF_INFO);
 }
 
 void StopActiveSession(bool exiting)
@@ -1129,7 +1251,13 @@ void StopActiveSession(bool exiting)
         g_app.recorder.Stop();
         PlayRecordingStopSound(exiting);
         if (g_app.recorder.LastStopWroteFile()) {
-            ShowBalloon(L"Recording stopped", (L"Saved:\n" + g_app.recorder.Path()).c_str(), NIIF_INFO);
+            std::wstring message = L"Saved:\n" + g_app.recorder.Path();
+            if (!g_app.recorder.LastError().empty()) {
+                message += L"\n\n";
+                message += g_app.recorder.LastError();
+            }
+            ShowBalloon(L"Recording stopped", message.c_str(),
+                        g_app.recorder.LastError().empty() ? NIIF_INFO : NIIF_WARNING);
         } else {
             std::wstring message = L"No file was written.";
             if (!g_app.recorder.LastError().empty()) {
@@ -1269,56 +1397,22 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_TIMER:
         if (wParam == kSessionTimerId && g_app.mode == SessionMode::Recording) {
             if (!g_app.recorder.Active()) {
-                // The recorder ended on its own (target closed, capture error, encode failure).
+                // The recorder ended on its own; StopActiveSession reports the reason.
                 StopActiveSession();
-                std::wstring detail = L"The recorder stopped on its own.";
-                if (!g_app.recorder.LastError().empty()) {
-                    detail += L"\n";
-                    detail += g_app.recorder.LastError();
-                }
-                ShowBalloon(L"Recording stopped", detail.c_str(), NIIF_WARNING);
                 return 0;
             }
             UpdateTrayTip();
             UpdateMainWindow();
-            bool usedGdi = false;
-            if (g_app.recorder.TakeTargetChanged(usedGdi)) {
-                if (usedGdi) {
-                    PlayGdiFallbackSound();
-                }
-                ShowBalloon(L"Recording source changed",
-                            usedGdi ? L"The selected window closed. Recording switched to the top-most window with GDI."
-                                    : L"The selected window closed. Recording re-hooked to the top-most window.",
-                            usedGdi ? NIIF_WARNING : NIIF_INFO);
-            }
             if (GetTickCount64() - g_app.recordingStart >= kMaxRecordingMs) {
                 StopActiveSession();
-                ShowBalloon(L"Recording stopped", L"Reached the 15 minute limit.", NIIF_INFO);
             }
         } else if (wParam == kSessionTimerId && g_app.mode == SessionMode::Casting) {
             if (!g_app.caster.Active()) {
-                // The cast ended on its own (target closed, capture error, encode failure).
                 StopActiveSession();
-                std::wstring detail = L"The cast stopped on its own.";
-                if (!g_app.caster.LastError().empty()) {
-                    detail += L"\n";
-                    detail += g_app.caster.LastError();
-                }
-                ShowBalloon(L"Cast stopped", detail.c_str(), NIIF_WARNING);
                 return 0;
             }
             UpdateTrayTip();
             UpdateMainWindow();
-            bool castUsedGdi = false;
-            if (g_app.caster.TakeTargetChanged(castUsedGdi)) {
-                if (castUsedGdi) {
-                    PlayGdiFallbackSound();
-                }
-                ShowBalloon(L"Cast source changed",
-                            castUsedGdi ? L"The selected window closed. The cast switched to the top-most window with GDI."
-                                        : L"The selected window closed. The cast re-hooked to the top-most window.",
-                            castUsedGdi ? NIIF_WARNING : NIIF_INFO);
-            }
         }
         return 0;
     case WM_COMMAND:
@@ -1347,6 +1441,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE /*previousInstance*/, PWSTR /*
                     int /*showCommand*/)
 {
     SetProcessDPIAware();
+    LoadCaptureBlacklist();
 
     if (wcsstr(GetCommandLineW(), L"--test-sounds") != nullptr) {
         PlayRecordingStartSound();
@@ -1359,10 +1454,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE /*previousInstance*/, PWSTR /*
         stop.write(reinterpret_cast<const char*>(g_recordStopSound.data()),
                    static_cast<std::streamsize>(g_recordStopSound.size()));
         Sleep(800);
-        PlayGdiFallbackSound();
-        std::ofstream gdi(ExecutableDirectory() + L"\\record_gdi.wav", std::ios::binary);
-        gdi.write(reinterpret_cast<const char*>(g_gdiFallbackSound.data()),
-                  static_cast<std::streamsize>(g_gdiFallbackSound.size()));
+        PlayHookFailureSound();
+        std::ofstream hookFailure(ExecutableDirectory() + L"\\record_hook_failure.wav", std::ios::binary);
+        hookFailure.write(reinterpret_cast<const char*>(g_hookFailureSound.data()),
+                          static_cast<std::streamsize>(g_hookFailureSound.size()));
         Sleep(800);
         return 0;
     }

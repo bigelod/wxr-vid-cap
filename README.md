@@ -28,13 +28,15 @@ same actions as the tray menu:
   to another running application, the top-most window, or a newly launched application.
 - `EXIT` — stops any session and exits.
 
-If the selected window closes during a session, the capture automatically tries to re-hook the
-top-most window. Recording does this without a dialog; casting also updates its source line in the
-WXR Capture Tool window. If the new hook produces no frames, capture falls back to GDI top-most.
+If the selected window closes during a session, recording tries to re-hook the top-most window and
+stops with an error if none is available. Casting keeps running: it sends blank video and silent
+audio, shows `waiting for a source` in the WXR Capture Tool window, and retries the top-most
+window periodically. Only starting a record/cast and fully stopping it show a balloon; source
+changes and retries are silent.
 
 Every `RECORD LOCAL` or `CAST LOCAL` opens the capture source screen:
 
-1. `Capture the top-most window` (default).
+1. `Capture the top-most window` (default) — resolves to the current top-most hookable application.
 2. `Capture a running application` — pick from the list of windows.
 3. `Start and inject capture into an application` — recommended for D3D11/12 and Vulkan, where the
    hook must be present before the app creates its device. Use `Browse...` to choose the EXE.
@@ -42,25 +44,31 @@ Every `RECORD LOCAL` or `CAST LOCAL` opens the capture source screen:
 Use `Refresh` to re-scan the running-applications list after starting or closing a game.
 `OK` proceeds; `Cancel` cancels the record or cast.
 
+`capture-blacklist.txt` beside the app lists executables that must never be captured or launched
+with the hook. It ships with `taskmgr.exe`, `explorer.exe`, `notepad.exe`, and Winlator's
+`wfm.exe`; edit it and restart the app to change the list. Blacklisted apps are also removed from
+the running-applications list.
+
 Capture, encoding, and audio work for both local recording and LAN casting. `RECORD LOCAL` writes an
 H.264 + Opus MKV at 1280×720, 24 fps, 4 Mbps video, 96 kbps audio. With a target selected it captures
 inside the process through the graphics API — D3D9 `EndScene`, D3D10/D3D11 `Present`, D3D12
 `Present` with a launch-time device capture, OpenGL `SwapBuffers`, and Vulkan `vkQueuePresentKHR`.
 That is the only way to see DXVK surfaces. D3D12 and Vulkan targets should use the launch option;
-other targets can be injected while running. If the hook cannot start it falls back to GDI window
-capture as a last resort. While recording, the tray tooltip shows elapsed time and the recording
-stops automatically at 15 minutes.
+other targets can be injected while running. There is no GDI fallback: if the hook cannot start,
+recording fails with the hook error. While recording, the tray tooltip shows elapsed time and the
+recording stops automatically at 15 minutes.
 
 `CAST LOCAL` runs the same capture and encode path but muxes H.264 and Opus into MPEG-TS and sends
 it over UDP to the receiver IP. It writes no file and does not wait for a receiver
 acknowledgement: VLC can open `udp://@:<port>` before or after the cast starts. The IP prompt is
 prefilled with the last address used (port 1234 by default); use a VLC network cache of 200–300 ms
-for low latency.
+for low latency. If no source can be hooked, the cast continues with black video and silent audio
+while a background probe retries the top-most window.
 
 Start and stop play short two-beep cues (low→medium on start, high→medium on stop), and a third low
-"dun dun" cue plays whenever the graphics hook fails — a GDI fallback during recording or casting,
-or a failed launch injection. Run `wxr-vid-cap.exe --test-sounds` to hear all three and write
-`record_start.wav`, `record_stop.wav`, and `record_gdi.wav` beside the app.
+"dun dun" cue plays when a manual record/cast start or launch cannot hook. Run
+`wxr-vid-cap.exe --test-sounds` to hear all three and write `record_start.wav`, `record_stop.wav`,
+and `record_hook_failure.wav` beside the app.
 `wxr-vid-cap.exe --hook-debug` runs the old 3-second hook diagnostic and writes `hook_debug.bmp`.
 
 The hook ships as `wxr_hook_dll.dll` (x64) and `wxr_hook_dll32.dll` (x86), injected by the app or
@@ -114,8 +122,8 @@ Notes:
 
 `cube_runner.exe` runs every test app four ways — windowed/fullscreen × 64-bit/32-bit — starting
 each app, waiting for its frame-rate title, recording six seconds through the normal recorder
-(graphics hook first, GDI fallback), stopping it, and keeping every MKV. Fullscreen uses a
-borderless window at the desktop resolution, matching how games present.
+(graphics hook only; a missing hook is logged and produces no MKV), stopping it, and keeping every
+MKV. Fullscreen uses a borderless window at the desktop resolution, matching how games present.
 
 ```
 cube_runner.exe
@@ -155,7 +163,9 @@ build\tools\x64\Release\record_test.exe --seconds 2 --fps 15 --width 1280 --heig
 ```
 
 Capture follows the top-most window and writes uncompressed frames, which makes the file large;
-this is a capture and lifecycle probe, not the final recorder.
+this is a capture and lifecycle probe, not the final recorder. These standalone probes still use
+the GDI `ScreenCapture` path and are useful only on a Windows desktop; the tray app uses the
+graphics hook and has no GDI fallback.
 
 ### Encoded recording probe
 
@@ -169,14 +179,15 @@ build\tools\x64\Release\encode_test.exe
 Defaults: 3 s, 15 fps, 1280×720, 4000 kbps. `openh264.dll` must sit next to the
 EXE; the build copies it there from `third_party\openh264\bin`.
 
-### Five-second HMD recorder
+### Five-second HMD recorder (Windows-only GDI probe)
 
 `record_5s.exe` takes no arguments: double-click it and it records 5 seconds to a timestamped MKV
 beside itself, then shows the path in a message box. A `<name>.mkv.log` with per-stage timings and
 a `windows:` inventory (`title - EXE.exe  (full\path\EXE.exe)` per visible window, `no title` when
 the caption is empty) is written next to the recording. The log also records `window:` (what was
-actually captured), `content: visible|black`, and `method: printwindow|window-dc|screen`. This is the
-easiest way to test on a headset.
+actually captured), `content: visible|black`, and `method: printwindow|window-dc|screen`.
+This standalone probe still uses GDI and is useful only on a Windows desktop; the tray app uses
+the graphics hook and has no GDI fallback.
 
 ### Cast smoke test
 

@@ -4,15 +4,28 @@
 
 IDI_APP_ICON ICON "wxrvid.ico"
 
-IDD_IP_DIALOG DIALOGEX 0, 0, 210, 64
+IDD_IP_DIALOG DIALOGEX 0, 0, 436, 170
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Cast receiver"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "IP address of the device running VLC:", -1, 7, 7, 196, 10
-    EDITTEXT        IDC_IP_EDIT, 7, 20, 196, 14, ES_AUTOHSCROLL
-    DEFPUSHBUTTON   "OK", IDOK, 99, 43, 50, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 153, 43, 50, 14
+    LTEXT           "IP address of the device running VLC:", -1, 7, 7, 280, 10
+    EDITTEXT        IDC_IP_EDIT, 7, 20, 280, 14, ES_AUTOHSCROLL
+    LTEXT           "Use the keypad or type an address.", -1, 7, 40, 280, 10
+    PUSHBUTTON      "7", IDC_IP_KEY_7, 300, 20, 40, 24
+    PUSHBUTTON      "8", IDC_IP_KEY_8, 344, 20, 40, 24
+    PUSHBUTTON      "9", IDC_IP_KEY_9, 388, 20, 40, 24
+    PUSHBUTTON      "4", IDC_IP_KEY_4, 300, 48, 40, 24
+    PUSHBUTTON      "5", IDC_IP_KEY_5, 344, 48, 40, 24
+    PUSHBUTTON      "6", IDC_IP_KEY_6, 388, 48, 40, 24
+    PUSHBUTTON      "1", IDC_IP_KEY_1, 300, 76, 40, 24
+    PUSHBUTTON      "2", IDC_IP_KEY_2, 344, 76, 40, 24
+    PUSHBUTTON      "3", IDC_IP_KEY_3, 388, 76, 40, 24
+    PUSHBUTTON      "0", IDC_IP_KEY_0, 300, 104, 40, 24
+    PUSHBUTTON      ".", IDC_IP_KEY_DOT, 344, 104, 40, 24
+    PUSHBUTTON      "BSP", IDC_IP_KEY_BACK, 388, 104, 40, 24
+    DEFPUSHBUTTON   "OK", IDOK, 300, 140, 60, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 368, 140, 60, 16
 END
 
 IDD_CAPTURE_SOURCE DIALOGEX 0, 0, 300, 258

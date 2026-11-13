@@ -7,6 +7,19 @@
 
 #define IDC_IP_EDIT 1001
 
+#define IDC_IP_KEY_0 1010
+#define IDC_IP_KEY_1 1011
+#define IDC_IP_KEY_2 1012
+#define IDC_IP_KEY_3 1013
+#define IDC_IP_KEY_4 1014
+#define IDC_IP_KEY_5 1015
+#define IDC_IP_KEY_6 1016
+#define IDC_IP_KEY_7 1017
+#define IDC_IP_KEY_8 1018
+#define IDC_IP_KEY_9 1019
+#define IDC_IP_KEY_DOT 1020
+#define IDC_IP_KEY_BACK 1021
+
 #define IDC_TARGET_TOPMOST 2001
 #define IDC_TARGET_EXE 2002
 #define IDC_PROCESS_LIST 2003

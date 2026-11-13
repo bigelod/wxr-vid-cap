@@ -1,5 +1,6 @@
 #include "hook_capture.h"
 
+#include "exclusions.h"
 #include "injection.h"
 
 #include <windows.h>
@@ -152,6 +153,11 @@ bool HookCapture::Start(const std::wstring& targetExecutable, int width, int hei
 
     if (targetExecutable.empty()) {
         error = L"No capture target is selected.";
+        return false;
+    }
+
+    if (IsExcludedExecutablePath(targetExecutable)) {
+        error = L"That application is blacklisted from capture: " + targetExecutable;
         return false;
     }
 

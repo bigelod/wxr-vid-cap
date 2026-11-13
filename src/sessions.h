@@ -26,9 +26,6 @@ public:
     const std::wstring& Backend() const;
     const std::wstring& LastError() const;
     std::wstring Source() const;
-    // True once after the selected target closes and capture switches to the top-most window.
-    // usedGdi is true when the switch ended on the GDI path.
-    bool TakeTargetChanged(bool& usedGdi);
 
 private:
     struct Impl;
@@ -58,8 +55,6 @@ public:
     const std::wstring& Backend() const;
     const std::wstring& LastError() const;
     std::wstring Source() const;
-    // True once after an automatic fallback to the new top-most window.
-    bool TakeTargetChanged(bool& usedGdi);
     std::wstring ViewerUrl() const;
 
 private:

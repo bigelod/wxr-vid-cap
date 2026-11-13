@@ -49,6 +49,7 @@ Build-Project "tools\wxr_launch.vcxproj" "Win32"
 Copy-Item "$root\build\tools\x64\$Configuration\wxr_hook_dll.dll" "$root\build\x64\$Configuration\wxr_hook_dll.dll" -Force
 Copy-Item "$root\build\tools\Win32\$Configuration\wxr_hook_dll32.dll" "$root\build\x64\$Configuration\wxr_hook_dll32.dll" -Force
 Copy-Item "$root\build\tools\Win32\$Configuration\wxr_inject32.exe" "$root\build\x64\$Configuration\wxr_inject32.exe" -Force
+Copy-Item "$root\src\capture-blacklist.txt" "$root\build\x64\$Configuration\capture-blacklist.txt" -Force
 
 # Capture test apps (one per graphics API) and the automated runner.
 foreach ($app in @("cube_d3d7", "cube_d3d8", "cube_d3d9", "cube_d3d10", "cube_d3d11", "cube_d3d12", "cube_gl", "cube_vk", "cube_runner")) {

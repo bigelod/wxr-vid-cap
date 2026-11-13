@@ -1,0 +1,10 @@
+# Executables that must never be captured or launched with the capture hook.
+# One executable name per line, case-insensitive. Lines starting with # are ignored.
+# Full paths are also accepted if you need to target one copy of an application.
+
+taskmgr.exe
+explorer.exe
+notepad.exe
+
+# Winlator's file manager.
+wfm.exe

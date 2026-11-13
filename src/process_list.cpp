@@ -132,7 +132,7 @@ std::vector<ProcessEntry> ListWindowProcesses()
                 ProcessEntry entry;
                 entry.processId = process.th32ProcessID;
                 entry.executablePath = ProcessImagePath(process.th32ProcessID);
-                if (IsExcludedExecutableName(FileNameOf(entry.executablePath))) {
+                if (IsExcludedExecutablePath(entry.executablePath)) {
                     continue;
                 }
                 entry.windowTitle = found->second.title;

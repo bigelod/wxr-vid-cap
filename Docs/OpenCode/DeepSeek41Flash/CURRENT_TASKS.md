@@ -163,13 +163,18 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
   re-muxed MP4 contains both `avc1` and `mp4a` tracks.
 - [x] Validate the real `Caster` on loopback (2026-11-12): a hooked D3D9 test app was captured and
   sent for 10 s; VLC 3.0.24 decoded the Opus track as two-channel audio alongside H.264.
-- [x] Automatic source fallback: if the selected window closes, recording and casting try to
-  re-hook the top-most application, then fall back to GDI top-most if the new hook produces no
-  frames. The WXR Capture Tool shows the current source.
+- [x] Automatic source fallback: if the selected window closes, recording tries to re-hook the
+  top-most application and stops with an error if none is available. Casting keeps running with
+  black video and silent audio, shows `waiting for a source`, and retries periodically.
+- [x] Remove the GDI fallback from the tray app. `Capture the top-most window` now resolves to a
+  hookable EXE; the standalone GDI probes remain only for Windows diagnostics.
+- [x] `capture-blacklist.txt` beside the app excludes `taskmgr.exe`, `explorer.exe`, `notepad.exe`,
+  and `wfm.exe` from capture, the running-app list, and launch-with-hook.
 - [x] `SELECT CAST SOURCE...` while casting opens the capture source screen and switches the live
   stream without stopping it. Recording has no such menu item and switches automatically.
 - [x] Scope the shared frame mapping to the target process ID, so a hook DLL left in an older
   application cannot feed frames into a later session.
+- [x] Only manual start and final stop show balloons; source changes and retries are silent.
 - [ ] Validate with VLC on a phone and a PC over a real LAN: stable playback for 15+ minutes,
   latency under ~1 s with cache at 200–300 ms, game frame rate at the Phase 1 baseline.
 - [ ] Confirm VLC can record the incoming stream with its own Record button, since that is the

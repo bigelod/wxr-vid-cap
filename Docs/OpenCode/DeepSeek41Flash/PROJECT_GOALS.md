@@ -44,15 +44,17 @@ paths.
   loaded after us, re-hook the new entry so we remain last in the chain.
 - Test chain-last behavior with a synthetic pre-hook that alters the frame: the captured image must
   show the alteration, and the app must keep rendering normally.
-- GDI/PrintWindow capture stays as a fallback for non-GPU windows and as a diagnostic path.
+- GDI/PrintWindow capture remains only in standalone Windows diagnostics; the tray app has no GDI
+  fallback because it cannot see WinlatorXR's game surface.
 - Risks: anti-cheat, per-fork injection restrictions, and stability. Test on-device before
   shipping; never inject into a process the user has not selected.
 - Encoding may use a statically linked, permissively licensed open-source encoder (allowed
   2026-11-10), as long as it ships inside our binary and needs no external app or runtime
   install. GPL code is excluded by this project's MIT license.
-- On-device GDI (2026-11-11): ~10 ms capture, ~8.6 ms convert, ~6.1 ms encode, ~1.3 ms audio,
-  ~26 ms/frame at 720p24. One 245 ms outlier was traced to HALFTONE scaling; COLORONCOLOR is used
-  now.
+- Historical GDI timings (2026-11-11): ~10 ms capture, ~8.6 ms convert, ~6.1 ms encode,
+  ~1.3 ms audio, ~26 ms/frame at 720p24. Those runs did not prove the game surface was visible;
+  WinlatorXR's rendered surface cannot be captured this way, so the tray app no longer uses GDI.
+  The 245 ms HALFTONE-scaling outlier is also historical.
 - Media Foundation probe in WinlatorXR (2026-11-10): `mfplat.dll` present, `MFStartup` returns
   `S_OK`, but **zero H.264 encoders and zero AAC encoders** are registered; only one H.264
   decoder. MF cannot be used for local recording in this fork.
@@ -217,26 +219,30 @@ mode changes.
 
 **Capture source screen**
 
-1. `Capture the top-most window` (default) — GDI fallback path.
+1. `Capture the top-most window` (default) — resolves to the current top-most hookable app.
 2. `Capture a running application` — choose from the list of visible windows.
 3. `Start and inject capture into an application` — **Recommended for D3D11/12 and Vulkan**;
    `Browse...` selects the EXE. The app is launched with `wxr_launch.exe` or `wxr_launch32.exe`
    depending on its bitness.
 
-`OK` proceeds; `Cancel` cancels the record or cast.
+`OK` proceeds; `Cancel` cancels the record or cast. `capture-blacklist.txt` beside the app is a
+plaintext list of executables that must never be captured or launched with the hook; it ships with
+`taskmgr.exe`, `explorer.exe`, `notepad.exe`, and `wfm.exe`.
 
 **Source changes**
 
-- If the selected window closes during recording, capture automatically switches to the top-most
-  window. No source dialog is shown in recording mode.
-- If it closes during casting, the same automatic switch happens; the cast keeps running and the
-  WXR Capture Tool source line updates.
+- If the selected window closes during recording, capture automatically tries the top-most window.
+  If none can be hooked, recording stops with an error.
+- If it closes during casting, the cast keeps running with black video and silent audio, shows
+  `waiting for a source`, and retries the top-most window periodically on a background thread so
+  the blank stream keeps flowing.
 - While casting, `SELECT CAST SOURCE...` opens the capture source screen to switch the live cast
   manually. Cancel leaves the current cast untouched.
-- If the automatic re-hook succeeds but produces no frames (for example, a non-graphics app), the
-  session falls back to GDI top-most capture after about two seconds.
+- If a hook produces no frames for about five seconds, it is dropped and the cast retries.
 - The frame bridge is named after the target process, so a hook DLL left in an older application
   cannot feed frames into a later session.
+- Only manually starting a record/cast and fully stopping it show a balloon; source changes and
+  retries are silent.
 
 **While a mode is active**
 
