@@ -43,13 +43,15 @@ build/
 Build/
 build-*/
 
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
+# Visual Studio / MSBuild
+.vs/
+*.user
+*.suo
+*.aps
+*.ipch
+*.VC.db
+*.VC.VC.opendb
+*.sln.docstates
 
 # Temporary files
 *.tmp
@@ -66,3 +68,11 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Vendored OpenH264 runtime (keep it despite the *.dll rule above)
+!third_party/openh264/bin/openh264.dll
+
+# Vendored Opus static library (keep it despite the *.lib rule above)
+!third_party/opus/lib/opus.lib
+
+Release/

@@ -1,0 +1,45 @@
+#include "resource.h"
+
+#include <windows.h>
+
+IDI_APP_ICON ICON "wxrvid.ico"
+
+IDD_IP_DIALOG DIALOGEX 0, 0, 210, 64
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Cast receiver"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "IP address of the device running VLC:", -1, 7, 7, 196, 10
+    EDITTEXT        IDC_IP_EDIT, 7, 20, 196, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 99, 43, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 153, 43, 50, 14
+END
+
+IDD_CAPTURE_SOURCE DIALOGEX 0, 0, 300, 258
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "WXR Capture Tool - Select Source"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    CONTROL         "Capture the top-most window (default)", IDC_TARGET_TOPMOST, "Button", BS_AUTORADIOBUTTON | WS_GROUP, 7, 7, 286, 10
+    CONTROL         "Capture a running application", IDC_TARGET_EXE, "Button", BS_AUTORADIOBUTTON, 7, 23, 220, 10
+    PUSHBUTTON      "Refresh", IDC_REFRESH, 238, 21, 55, 14
+    LISTBOX         IDC_PROCESS_LIST, 17, 37, 276, 100, LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "", IDC_TARGET_PATH, 17, 140, 276, 10
+    CONTROL         "Start and inject capture into an application", IDC_TARGET_LAUNCH, "Button", BS_AUTORADIOBUTTON, 7, 158, 286, 10
+    LTEXT           "Recommended for D3D11/12 and Vulkan", -1, 17, 171, 276, 10
+    EDITTEXT        IDC_LAUNCH_PATH, 17, 185, 216, 14, ES_AUTOHSCROLL | ES_READONLY
+    PUSHBUTTON      "Browse...", IDC_BROWSE, 238, 185, 55, 14
+    DEFPUSHBUTTON   "OK", IDOK, 191, 238, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 245, 238, 50, 14
+END
+
+IDD_MAIN_DIALOG DIALOGEX 0, 0, 220, 116
+STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "WXR Capture Tool"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Idle", IDC_MAIN_STATUS, 7, 7, 206, 22
+    PUSHBUTTON      "RECORD LOCAL", IDC_MAIN_ACTION, 7, 34, 206, 16
+    PUSHBUTTON      "CAST LOCAL", IDC_MAIN_CAST, 7, 56, 206, 16
+    PUSHBUTTON      "EXIT", IDC_MAIN_EXIT, 7, 84, 206, 16
+END

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{C0BE0015-1111-4A01-9000-000000000015}</ProjectGuid>
+    <RootNamespace>cubetestrunner</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <Import Project="testapp.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup>
+    <TargetName>cube_runner</TargetName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ClCompile Include="cube_runner.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyRecorder" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\tools\$(Platform)\$(Configuration)\record_5s.exe" DestinationFolder="$(OutDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\third_party\openh264\bin\openh264.dll" DestinationFolder="$(OutDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\tools\x64\$(Configuration)\wxr_hook_dll.dll" DestinationFolder="$(OutDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\tools\Win32\$(Configuration)\wxr_hook_dll32.dll" DestinationFolder="$(OutDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\tools\Win32\$(Configuration)\wxr_inject32.exe" DestinationFolder="$(OutDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\wxr_launch.exe" DestinationFolder="$(OutDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\wxr_launch32.exe" DestinationFolder="$(OutDir)" ContinueOnError="true" />
+  </Target>
+</Project>
