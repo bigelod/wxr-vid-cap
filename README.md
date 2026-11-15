@@ -13,13 +13,29 @@ Output lands in `build\x64\<Configuration>\wxr-vid-cap.exe`. Release uses the st
 executable depends only on system DLLs and can be copied into a Winlator container without
 shipping a VC++ redistributable.
 
+`.\build.ps1` is the canonical build: it builds the 32-bit helpers, the solution, the launchers,
+and the cube test apps. It also refreshes the on-device layout under `E:\tmp\WXRVIDCAP` when that
+path exists:
+
+- `DeployReady` — runtime-only shipping files (tray app, hook DLLs, injectors, launchers, OpenH264,
+  blacklist).
+- `DebugVersion` — the same shipping files plus `cube_runner.exe`, `record_5s.exe`, and every cube
+  test app, ready to run the capture suite.
+- `NovTests` — created (not cleared) for the runner's results. Each run writes
+  `NovTests\<timestamp>\cube_tests.log` and its MKVs, or use `--out-root <path>` to override.
+
+Pass `-DeployRoot <path>` to target another folder, or `-DeployRoot ""` to skip. `OldTests` is left
+untouched as the archive of older suites.
+
 ## Running
 
 The app is tray-only: launch it and look for the red record dot in the notification area.
 Double-click it (or right-click → `SHOW`) to open the **WXR Capture Tool** window, which has the
 same actions as the tray menu:
 
-- `SHOW` — opens the WXR Capture Tool window.
+- `SHOW` — opens the WXR Capture Tool window. While it is open the app has a taskbar button;
+  minimizing or closing the window returns it to the notification area without stopping an active
+  session.
 - `RECORD LOCAL` — chooses a capture source, asks for the MKV path, and starts recording.
 - `CAST LOCAL` — asks for the receiver IP (prefilled with the last one), then the capture source,
   and starts the live MPEG-TS/UDP stream.
@@ -49,16 +65,35 @@ with the hook. It ships with `taskmgr.exe`, `explorer.exe`, `notepad.exe`, and W
 `wfm.exe`; edit it and restart the app to change the list. Blacklisted apps are also removed from
 the running-applications list.
 
+Opening a **new** `taskmgr.exe` instance brings up the WXR Capture Tool window. The app tracks the
+set of running taskmgr processes (checked once a second and immediately on taskmgr window events);
+the window opens only when that count increases. Instances already open when the app starts are
+remembered without opening it, and focusing an already-tracked taskmgr does not reopen it. Closing
+taskmgr and launching it again counts as a new instance.
+
 Capture, encoding, and audio work for both local recording and LAN casting. `RECORD LOCAL` opens a
 Save dialog prefilled with `D:\WXRVIDCAP\capture_YYYY-MM-DD_hh_mm_ss.mkv` (the directory is created
 when missing) and writes an H.264 + Opus MKV at 1280×720, 24 fps, 4 Mbps video, 96 kbps audio. With a
 target selected it captures inside the process through the graphics API — DirectDraw
-`Blt`/`BltFast`/`Flip`, D3D9 `EndScene`, D3D10/D3D11 `Present`, D3D12 `Present` with a launch-time
-device capture, OpenGL `SwapBuffers`, and Vulkan `vkQueuePresentKHR`. That is the only way to see
-DXVK surfaces. D3D12 and Vulkan targets should use the launch option; other targets can be injected
-while running. There is no GDI fallback: if the hook cannot start, recording fails with the hook
-error. While recording, the tray tooltip shows elapsed time and the recording stops automatically at
-15 minutes.
+`Blt`/`BltFast`/`Flip`, D3D9 `EndScene`, D3D10/D3D11 `Present` and `Present1`, D3D12
+`Present`/`Present1` with a launch-time device capture, OpenGL `SwapBuffers`, and Vulkan
+`vkQueuePresentKHR`. That is the only way to see DXVK surfaces. D3D12 and Vulkan targets should use
+the launch option; other targets can be injected while running. There is no GDI fallback: if the
+hook cannot start, recording fails with the hook error. While recording, the tray tooltip shows
+elapsed time and the recording stops automatically at 15 minutes.
+
+While recording or casting, the host watches for new frames. If no frame arrives for about two
+seconds, it signals the resident hook to rescan its modules, asks for a re-attach, and if that does
+not restore frames it closes the hook and re-hooks the same application; it keeps retrying while
+that app is running. The WXR Capture Tool window and tray tip show `(re-hooking)` during this, and
+the recording/debug log records `source: footage lost` and `source: footage recovered` lines.
+
+Local recording follows the same no-source rule as casting. It holds the last frame for about half
+a second, then writes a pre-rendered `no-source.bmp` — a black frame with large centered white
+`NO SOURCE` — and silent Opus audio while it keeps retrying the hook. If recording starts before a
+source can be hooked, the file is still created and filled with that frame instead of refusing to
+record. `CAST LOCAL` uses the same frame for its blank output. `no-source.bmp` ships beside the app
+in `DeployReady` and `DebugVersion`; keep it next to `wxr-vid-cap.exe`.
 
 `CAST LOCAL` runs the same capture and encode path but muxes H.264 and Opus into MPEG-TS and sends
 it over UDP to the receiver IP. It writes no file and does not wait for a receiver
@@ -113,10 +148,13 @@ itself with the API setup result and audio status, which is useful when a contai
 Notes:
 
 - The capture hook handles DirectDraw (`Blt`, `BltFast`, `Flip`, legacy and 7 interfaces), D3D7,
-  D3D8, D3D9, D3D10, D3D11, D3D12, OpenGL, and Vulkan. D3D12 and Vulkan need launch-time injection
-  (`wxr_launch.exe` / `wxr_launch32.exe`), which the capture source screen's `Start and inject
-  capture into an application` option uses. The container's d3d8 is 32-bit (the D3D8 games are
-  32-bit), so `cube_d3d8.exe` is built for Win32 and the x64 host injects the 32-bit hook.
+  D3D8, D3D9, D3D10/D3D11 (`Present` and `Present1`), D3D12, OpenGL, and Vulkan. D3D12 and Vulkan
+  need launch-time injection (`wxr_launch.exe` / `wxr_launch32.exe`), which the capture source
+  screen's `Start and inject capture into an application` option uses. The container's d3d8 is
+  32-bit (the D3D8 games are 32-bit), so `cube_d3d8.exe` is built for Win32 and the x64 host injects
+  the 32-bit hook. `Present1` matters for Unity: it renders its splash through `Present`, then
+  switches the main swapchain to `Present1`; without that hook the recording shows the splash and
+  then a static gray frame while the audio continues.
 - Every app accepts `--fullscreen`, which creates a borderless window at the desktop resolution.
   `cube_runner` runs the whole set windowed and fullscreen, in both 64-bit and 32-bit builds
   (`<app>.exe` and `<app>32.exe`). Vulkan is 64-bit only here.
@@ -140,12 +178,13 @@ MKV. Fullscreen uses a borderless window at the desktop resolution, matching how
 cube_runner.exe
 ```
 
-It writes `cube_tests\<timestamp>\cube_tests.log` beside itself with a `## windowed64`,
-`## windowed32`, `## fullscreen64`, and `## fullscreen32` section. Each line reports the backend,
-injection method, source resolution, `visible`/`black`, frame count, and video file
-(`d3d9_windowed64.mkv`, `d3d9_windowed32.mkv`, ...). Videos are never deleted. `build.ps1` copies
-`record_5s.exe`, `openh264.dll`, the launchers, the hook DLLs, and both app architectures next to
-the runner.
+It writes `NovTests\<timestamp>\cube_tests.log` under the deployment root (the parent of the
+`DebugVersion` folder containing the runner) with a `## windowed64`, `## windowed32`,
+`## fullscreen64`, and `## fullscreen32` section. Use `--out-root <path>` to put the run elsewhere.
+Each line reports the backend, injection method, source resolution, `visible`/`black`, frame count,
+and video file (`d3d9_windowed64.mkv`, `d3d9_windowed32.mkv`, ...). Videos are never deleted.
+`build.ps1` copies `record_5s.exe`, `openh264.dll`, the launchers, the hook DLLs, and both app
+architectures next to the runner in `DebugVersion`.
 
 The 32-bit passes use `<app>32.exe` and inject through `wxr_inject32.exe` (or `wxr_launch32.exe`
 for D3D12). Vulkan is 64-bit only because there is no 32-bit Vulkan import library here.

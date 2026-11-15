@@ -26,6 +26,10 @@ public:
                int firstFrameTimeoutMs = 6000, int retryTimeoutMs = 0);
     void Stop();
 
+    // Signals the resident hook to rescan its modules and waits briefly for a new frame without
+    // re-injecting the DLL. Use this before a full Stop/Start when footage stops arriving.
+    bool Reattach(int timeoutMs);
+
     // Waits up to timeoutMs for a frame newer than the last one returned. The result is always
     // width() x height() BGRA, letterboxed when the source aspect ratio differs.
     bool Capture(std::vector<std::uint8_t>& bgra, int timeoutMs, std::wstring& error);

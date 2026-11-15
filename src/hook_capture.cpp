@@ -358,6 +358,38 @@ void HookCapture::Stop()
     injectionMethod_.clear();
 }
 
+bool HookCapture::Reattach(int timeoutMs)
+{
+    if (!active_ || !reader_.Active()) {
+        return false;
+    }
+
+    reader_.SetEnabled(true);
+    if (rescanEvent_ != nullptr) {
+        SetEvent(rescanEvent_);
+    }
+
+    std::vector<std::uint8_t> frame;
+    int sourceWidth = 0;
+    int sourceHeight = 0;
+    std::int64_t timestamp = 0;
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(std::max(timeoutMs, 0));
+    for (;;) {
+        if (reader_.Read(frame, sourceWidth, sourceHeight, timestamp)) {
+            sourceWidth_ = sourceWidth;
+            sourceHeight_ = sourceHeight;
+            ++framesRead_;
+            pending_ = std::move(frame);
+            hasPending_ = true;
+            active_ = true;
+            return true;
+        }
+        if (GetTickCount64() >= deadline || !IsProcessAlive(processId_)) {
+            return false;
+        }
+    }
+}
+
 bool HookCapture::Capture(std::vector<std::uint8_t>& bgra, int timeoutMs, std::wstring& error)
 {
     (void)error;

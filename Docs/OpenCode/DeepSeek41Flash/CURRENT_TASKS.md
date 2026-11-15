@@ -84,6 +84,13 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
 
 - [x] Background-resident process with tray icon, menu, and stub sessions. Replaced the temporary
   message box in `src/main.cpp`.
+- [x] `SHOW` window appears in the taskbar while it is open and disappears when it is minimized or
+  closed back to the notification area. The dialog is created unowned and given `WS_EX_APPWINDOW`,
+  which also works under Wine's shell. Minimizing hides the window (a later `SHOW` restores it), and
+  closing destroys it; both leave the tray process and any active recording/cast running.
+- [x] Capture-source mode buttons are explicitly mutually exclusive. The three radios are separated
+  by the list/buttons/labels in the template, and Wine could leave two checked at once; the dialog
+  now unchecks the other two on every `BN_CLICKED`.
 - [x] Tray menu: `SHOW` / `RECORD LOCAL` / `CAST LOCAL` / `EXIT` when idle;
   `STOP RECORDING` or `STOP CASTING` while active. `SHOW` opens the same actions in a window.
 - [x] `RECORD LOCAL`: capture source screen, then a Save dialog prefilled with
@@ -95,9 +102,12 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
 - [x] **Cast jitter buffer.** Muxed video frames are queued (default 8 frames, `[cast]
   jitter_frames`, 0 disables) and sent from a dedicated thread at a steady 24 fps cadence. Adds
   receiver-side latency but absorbs encode/network jitter for smoother VLC playback.
-- [x] **taskmgr integration.** Opening `taskmgr.exe` triggers SHOW. Selecting a running app in the
-  source list brings that app forward; on WinlatorXR (`Z:\tmp` exists) taskmgr instances are closed
-  first with `WM_CLOSE`, then force-terminated if still alive after two seconds.
+- [x] **taskmgr integration.** A new `taskmgr.exe` instance (an increase in the running taskmgr
+  process count) triggers SHOW. The count is seeded at startup, refreshed once a second, and
+  refreshed immediately on taskmgr WinEvents, so focusing an existing taskmgr does not reopen the
+  window. Selecting a running app in the source list brings that app forward; on WinlatorXR
+  (`Z:\tmp` exists) taskmgr instances are closed first with `WM_CLOSE`, then force-terminated if
+  still alive after two seconds.
 - [x] Capture source screen: top-most window (default), a running application from a list, or
   launch an EXE with the hook (`Recommended for D3D11/12 and Vulkan`).
 - [x] Explicit session state machine (idle / recording / casting) so the two modes cannot overlap
@@ -119,6 +129,23 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
 - [x] **D3D11 Present hook proof of concept.** MinHook on the live `Present` vtable entry, two
   staging textures for stall-free readback, 30 fps capture cap, frames published through
   `Local\wxrvidcap_frames`. Validated locally against `tools/d3d11_test.exe`.
+- [x] **Footage watchdog.** Recorder and caster track the last new frame. After ~2 s without one
+  they signal the resident hook to rescan, try a lightweight re-attach, then fully re-hook the same
+  application and keep retrying while it runs. The SHOW status/tray tip shows `(re-hooking)` and
+  the log records `source: footage lost` / `source: footage recovered`. Verified by suspending a
+  test app for 5 s mid-recording: the log showed the loss, the successful same-app re-hook, and the
+  recording finished `result: ok`.
+- [x] **Local NO SOURCE fallback.** Local recording now behaves like casting when footage is
+  missing: after a 500 ms hold it encodes a pre-rendered `no-source.bmp` (black frame, large white
+  `NO SOURCE`) and silent Opus, and keeps retrying. A recording can start before the source hooks;
+  it creates the file immediately and fills it with NO SOURCE until frames arrive. Verified with a
+  blacklisted target: 3 s file (18 KB), 73 frames, audio packets 3 bytes/frame, and VLC showed the
+  correct NO SOURCE frame.
+- [x] **D3D11 `Present1` hook.** Unity renders its splash through `Present`, then switches the main
+  swapchain to `IDXGISwapChain1::Present1` (vtable slot 22). A 2026-11-15 recording captured the
+  splash and then froze on a gray frame with full audio; the hook now installs both `Present` and
+  `Present1` (DXGI 1.1+) and skips `DXGI_PRESENT_TEST` calls. Verified the hook log finds and hooks
+  both addresses and `cube_d3d11` still captures at ~30 fps. Re-test against the Unity title.
 - [~] **Chain-last hook management.** The detour calls the previous `Present`/`EndScene` pointer, so
   mod hooks keep running. Re-hooking after a vtable change is not implemented yet.
 - [ ] **Synthetic pre-hook test.** Install a test hook before ours that tints the frame; verify the
@@ -159,11 +186,20 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
 - [x] **D3D8 capture.** Hooks `IDirect3DDevice8::Present` and reads the back buffer with
   `GetBackBuffer` + `LockRect`. The container's d3d8 is 32-bit, so the 32-bit pass uses
   `cube_d3d832.exe` and injects the 32-bit hook through `wxr_inject32.exe`.
-- [ ] **Validate the test apps on-device.** Run `cube_runner.exe` once; it records every API
-  windowed and fullscreen, in 64-bit and 32-bit builds, keeps the videos, and writes one
-  `cube_tests.log`. Check each app's `testapp.log` for API/audio status and inspect each MKV for the
-  renderer label. The 32-bit D3D8 pass is the one that matches the container's d3d8; D3D12 needs
-  vkd3d-proton. `cube_ddraw.exe`/`cube_ddraw32.exe` cover the new DirectDraw path.
+- [ ] **Validate the test apps on-device.** Run `DebugVersion\cube_runner.exe` once; it records every
+  API windowed and fullscreen, in 64-bit and 32-bit builds, keeps the videos, and writes one
+  `cube_tests.log` under `NovTests\<timestamp>`. Check each app's `testapp.log` for API/audio status
+  and inspect each MKV for the renderer label. The 32-bit D3D8 pass is the one that matches the
+  container's d3d8; D3D12 needs vkd3d-proton. `cube_ddraw.exe`/`cube_ddraw32.exe` cover the new
+  DirectDraw path.
+- [x] **Refresh the standalone runner/recorder.** The 2026-11-13 `LatestTest` run used the old
+  `record_5s.exe` with the removed GDI fallback, so every "ok" clip was a blank/white window-DC
+  capture while casting still worked. `record_5s.exe`, `cube_runner.exe`, and all test apps are now
+  rebuilt from the hook-only source. The runner rejects a clip whose log shows GDI, and includes
+  `ddraw`. A local 3 s DDraw check reports `backend: graphics hook`, 72 frames, ~1 MB.
+- [ ] Re-run `cube_runner.exe` with the refreshed binaries and review the new clips. Expect the
+  64-bit D3D8 (no 64-bit d3d8.dll), D3D12 (no vkd3d), and missing `cube_vk32.exe` failures; the
+  32-bit "no render window" cases still need investigation under Box64.
 - [x] **Integrate with Recorder/Caster.** `Recorder` and `Caster` share the same hook-first capture
   path; the recorder writes MKV, the caster encodes the same frames and audio to MPEG-TS/UDP.
 - [ ] **Safety:** only inject into the process the user picked; never into system/anti-cheat
@@ -223,3 +259,8 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done (move to `CO
 - [ ] Keep `PROJECT_GOALS.md` open questions current; move resolved answers into the relevant
   section instead of leaving them dangling.
 - [x] Add a build/run section to the top-level `README.md` once Phase 0 lands.
+- [x] `build.ps1` refreshes the deployment layout under `E:\tmp\WXRVIDCAP`:
+  `DeployReady` for the runtime-only tray app, `DebugVersion` for the tray app plus the cube runner
+  and all test apps, and an empty `NovTests` for new runs. `OldTests` is the archived suites.
+  `-DeployRoot` overrides the location. `cube_runner` writes each run to
+  `NovTests\<timestamp>` (or `--out-root`).

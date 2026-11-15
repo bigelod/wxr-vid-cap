@@ -36,6 +36,7 @@
 namespace {
 
 using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);
+using Present1Fn = HRESULT(WINAPI*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using EndSceneFn = HRESULT(WINAPI*)(IDirect3DDevice9*);
 
 constexpr ULONGLONG kMinCaptureIntervalMs = 1000 / 30;
@@ -43,6 +44,7 @@ constexpr ULONGLONG kMinCaptureIntervalMs = 1000 / 30;
 HINSTANCE g_module = nullptr;
 SharedFrameWriter g_writer;
 PresentFn g_originalPresent = nullptr;
+Present1Fn g_originalPresent1 = nullptr;
 EndSceneFn g_originalEndScene = nullptr;
 std::ofstream g_log;
 std::mutex g_logMutex;
@@ -203,7 +205,7 @@ PFN_vkUnmapMemory g_vkUnmapMemory = nullptr;
 
 void CaptureFrameD3D10(IDXGISwapChain* swapChain);
 void CaptureFrameD3D12(IDXGISwapChain* swapChain);
-void* FindPresentAddressD3D12();
+void* FindPresentAddressD3D12(void** present1Out);
 bool InstallD3D12Hooks();
 bool InstallOpenGLHooks();
 bool InstallVulkanHooks();
@@ -262,13 +264,16 @@ bool ShouldCapture()
     return true;
 }
 
-void* FindPresentAddress()
+void* FindPresentAddress(void** present1Out)
 {
+    if (present1Out != nullptr) {
+        *present1Out = nullptr;
+    }
     // Use the D3D11 module the target already loaded. Never load it ourselves: pulling DXVK's
     // d3d11.dll into a D3D9-only game would initialize a second graphics stack for nothing.
     HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
     if (d3d11 == nullptr) {
-        return FindPresentAddressD3D12();
+        return FindPresentAddressD3D12(present1Out);
     }
     auto createDevice = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
         GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain"));
@@ -323,6 +328,20 @@ void* FindPresentAddress()
         void** vtable = *reinterpret_cast<void***>(swapChain);
         present = vtable[8];
         Log("found Present at 0x" + std::to_string(reinterpret_cast<unsigned long long>(present)));
+
+        // Unity and other DXGI 1.1+ apps switch to IDXGISwapChain1::Present1 after startup.
+        // Present1 is slot 22 (after GetDesc1, GetFullscreenDesc, GetHwnd, GetCoreWindow).
+        IDXGISwapChain1* swapChain1 = nullptr;
+        if (present1Out != nullptr &&
+            SUCCEEDED(swapChain->QueryInterface(__uuidof(IDXGISwapChain1),
+                                                reinterpret_cast<void**>(&swapChain1))) &&
+            swapChain1 != nullptr) {
+            void** vtable1 = *reinterpret_cast<void***>(swapChain1);
+            *present1Out = vtable1[22];
+            Log("found Present1 at 0x" +
+                std::to_string(reinterpret_cast<unsigned long long>(*present1Out)));
+            swapChain1->Release();
+        }
     } else {
         Log("D3D11CreateDeviceAndSwapChain failed: 0x" + std::to_string(static_cast<unsigned long>(result)));
     }
@@ -1221,8 +1240,11 @@ HRESULT WINAPI D3D12CreateDeviceDetour(IUnknown* adapter, D3D_FEATURE_LEVEL leve
     return result;
 }
 
-void* FindPresentAddressD3D12()
+void* FindPresentAddressD3D12(void** present1Out)
 {
+    if (present1Out != nullptr) {
+        *present1Out = nullptr;
+    }
     HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
     HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
     if (d3d12 == nullptr || dxgi == nullptr) {
@@ -1274,7 +1296,11 @@ void* FindPresentAddressD3D12()
             IDXGISwapChain1* swapChain = nullptr;
             if (SUCCEEDED(factory->CreateSwapChainForHwnd(queue, window, &swapDescription, nullptr, nullptr,
                                                           &swapChain))) {
-                present = (*reinterpret_cast<void***>(swapChain))[8];
+                void** vtable = *reinterpret_cast<void***>(swapChain);
+                present = vtable[8];
+                if (present1Out != nullptr) {
+                    *present1Out = vtable[22];
+                }
                 swapChain->Release();
             }
             DestroyWindow(window);
@@ -2083,27 +2109,60 @@ bool InstallDdrawHooks()
 
 HRESULT WINAPI PresentDetour(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
 {
-    CaptureFrame(swapChain);
+    if ((flags & DXGI_PRESENT_TEST) == 0) {
+        CaptureFrame(swapChain);
+    }
     return g_originalPresent != nullptr ? g_originalPresent(swapChain, syncInterval, flags) : E_FAIL;
+}
+
+HRESULT WINAPI Present1Detour(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags,
+                              const DXGI_PRESENT_PARAMETERS* parameters)
+{
+    if (swapChain != nullptr && (flags & DXGI_PRESENT_TEST) == 0) {
+        CaptureFrame(swapChain);
+    }
+    return g_originalPresent1 != nullptr ? g_originalPresent1(swapChain, syncInterval, flags, parameters) : E_FAIL;
 }
 
 bool InstallPresentHook()
 {
-    void* present = FindPresentAddress();
-    if (present == nullptr) {
-        return false;
+    if (g_originalPresent != nullptr && g_originalPresent1 != nullptr) {
+        return true;
     }
 
-    const MH_STATUS created =
-        MH_CreateHook(present, reinterpret_cast<LPVOID>(&PresentDetour), reinterpret_cast<LPVOID*>(&g_originalPresent));
-    Log("MH_CreateHook(Present)=" + std::to_string(static_cast<int>(created)));
-    if (created != MH_OK) {
-        return false;
+    void* present1 = nullptr;
+    void* present = FindPresentAddress(&present1);
+
+    bool anyHooked = false;
+    if (present != nullptr && g_originalPresent == nullptr) {
+        const MH_STATUS created =
+            MH_CreateHook(present, reinterpret_cast<LPVOID>(&PresentDetour),
+                          reinterpret_cast<LPVOID*>(&g_originalPresent));
+        Log("MH_CreateHook(Present)=" + std::to_string(static_cast<int>(created)));
+        if (created == MH_OK) {
+            const MH_STATUS enabled = MH_EnableHook(present);
+            Log("MH_EnableHook(Present)=" + std::to_string(static_cast<int>(enabled)));
+            anyHooked = enabled == MH_OK;
+        }
+    } else if (g_originalPresent != nullptr) {
+        anyHooked = true;
     }
 
-    const MH_STATUS enabled = MH_EnableHook(present);
-    Log("MH_EnableHook(Present)=" + std::to_string(static_cast<int>(enabled)));
-    return enabled == MH_OK;
+    if (present1 != nullptr && g_originalPresent1 == nullptr) {
+        const MH_STATUS created =
+            MH_CreateHook(present1, reinterpret_cast<LPVOID>(&Present1Detour),
+                          reinterpret_cast<LPVOID*>(&g_originalPresent1));
+        Log("MH_CreateHook(Present1)=" + std::to_string(static_cast<int>(created)));
+        if (created == MH_OK) {
+            const MH_STATUS enabled = MH_EnableHook(present1);
+            Log("MH_EnableHook(Present1)=" + std::to_string(static_cast<int>(enabled)));
+            anyHooked = anyHooked || enabled == MH_OK;
+        }
+    } else if (g_originalPresent1 != nullptr) {
+        anyHooked = true;
+    }
+
+    return anyHooked;
 }
 
 bool InstallEndSceneHook()

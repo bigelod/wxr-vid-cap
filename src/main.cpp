@@ -19,6 +19,7 @@
 #include <cwchar>
 #include <fstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -47,6 +48,8 @@ constexpr UINT kMenuExit = 40006;
 constexpr UINT kMenuSelectCastSource = 40007;
 
 constexpr UINT_PTR kSessionTimerId = 1;
+constexpr UINT_PTR kTaskmgrPollTimerId = 2;
+constexpr UINT kTaskmgrPollIntervalMs = 1000;
 constexpr ULONGLONG kMaxRecordingMs = 15ull * 60ull * 1000ull;
 constexpr int kLaunchHookTimeoutMs = 30000;
 constexpr int kLateHookTimeoutMs = 30000;
@@ -63,6 +66,8 @@ struct AppState {
     UINT taskbarCreatedMessage = 0;
     HWINEVENTHOOK taskmgrShowHook = nullptr;
     HWINEVENTHOOK taskmgrForegroundHook = nullptr;
+    // taskmgr PIDs currently counted as open. A new PID (an increase in the count) triggers SHOW.
+    std::unordered_set<unsigned long> taskmgrProcessIds;
     ULONGLONG recordingStart = 0;
     AppSettings settings;
     SessionMode mode = SessionMode::Idle;
@@ -263,7 +268,10 @@ void UpdateMainWindow()
     case SessionMode::Recording: {
         const ULONGLONG elapsedSeconds = (GetTickCount64() - g_app.recordingStart) / 1000;
         const std::wstring source = g_app.recorder.Source();
-        const std::wstring sourceName = source.empty() ? L"top-most window" : FileNameOf(source);
+        std::wstring sourceName = source.empty() ? L"no source" : FileNameOf(source);
+        if (g_app.recorder.Recovering() && !source.empty()) {
+            sourceName += L" (re-hooking)";
+        }
         wchar_t buffer[256] = {};
         swprintf_s(buffer, L"Recording %02llu:%02llu - source: %s\nSaved to %s", elapsedSeconds / 60,
                    elapsedSeconds % 60, sourceName.c_str(), FileNameOf(g_app.recorder.Path()).c_str());
@@ -275,7 +283,10 @@ void UpdateMainWindow()
     case SessionMode::Casting: {
         const ULONGLONG elapsedSeconds = (GetTickCount64() - g_app.recordingStart) / 1000;
         const std::wstring source = g_app.caster.Source();
-        const std::wstring sourceName = source.empty() ? L"waiting for a source" : FileNameOf(source);
+        std::wstring sourceName = source.empty() ? L"waiting for a source" : FileNameOf(source);
+        if (g_app.caster.Recovering() && !source.empty()) {
+            sourceName += L" (re-hooking)";
+        }
         wchar_t buffer[256] = {};
         swprintf_s(buffer, L"Casting %02llu:%02llu to %s\nSource: %s", elapsedSeconds / 60,
                    elapsedSeconds % 60, g_app.settings.receiverIp.c_str(), sourceName.c_str());
@@ -302,11 +313,20 @@ void UpdateMainWindow()
 INT_PTR CALLBACK MainDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM /*lParam*/)
 {
     switch (message) {
-    case WM_INITDIALOG:
+    case WM_INITDIALOG: {
         g_app.mainWindow = dialog;
         ApplyDialogIcon(dialog);
+
+        // The window is unowned while it is open, so the shell gives it a taskbar button. Make that
+        // explicit as well; Wine's taskbar otherwise hides popups that do not ask for one.
+        LONG_PTR exStyle = GetWindowLongPtrW(dialog, GWL_EXSTYLE);
+        exStyle |= WS_EX_APPWINDOW;
+        exStyle &= ~static_cast<LONG_PTR>(WS_EX_TOOLWINDOW);
+        SetWindowLongPtrW(dialog, GWL_EXSTYLE, exStyle);
+
         UpdateMainWindow();
         return TRUE;
+    }
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDC_MAIN_ACTION:
@@ -331,6 +351,13 @@ INT_PTR CALLBACK MainDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM
         default:
             return FALSE;
         }
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_MINIMIZE) {
+            // Minimize sends the SHOW window back to the tray instead of leaving a taskbar button.
+            ShowWindow(dialog, SW_HIDE);
+            return TRUE;
+        }
+        return FALSE;
     case WM_CLOSE:
         DestroyWindow(dialog);
         return TRUE;
@@ -358,7 +385,9 @@ void ShowMainWindow()
         return;
     }
 
-    g_app.mainWindow = CreateDialogParamW(g_app.instance, MAKEINTRESOURCEW(IDD_MAIN_DIALOG), g_app.window,
+    // Unowned on purpose: an owned dialog gets no taskbar button (Wine's shell is especially
+    // strict), and the SHOW window should be reachable from the taskbar while it is open.
+    g_app.mainWindow = CreateDialogParamW(g_app.instance, MAKEINTRESOURCEW(IDD_MAIN_DIALOG), nullptr,
                                           MainDialogProc, 0);
     if (g_app.mainWindow != nullptr) {
         UpdateMainWindow();
@@ -401,6 +430,50 @@ bool ProcessIsAlive(unsigned long processId)
     return alive;
 }
 
+std::vector<unsigned long> FindTaskManagerProcessIds()
+{
+    std::vector<unsigned long> processIds;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W process = {};
+        process.dwSize = sizeof(process);
+        if (Process32FirstW(snapshot, &process) != FALSE) {
+            do {
+                if (_wcsicmp(process.szExeFile, L"taskmgr.exe") == 0 &&
+                    process.th32ProcessID != GetCurrentProcessId()) {
+                    processIds.push_back(process.th32ProcessID);
+                }
+            } while (Process32NextW(snapshot, &process) != FALSE);
+        }
+        CloseHandle(snapshot);
+    }
+    return processIds;
+}
+
+// Compares the current taskmgr process set with the last snapshot. Returns true only when at least
+// one new instance appeared, so switching to an already-tracked taskmgr does not reopen SHOW.
+// Closed instances are removed from the set, which makes a later relaunch count as an increase.
+bool RefreshTaskmgrInstances()
+{
+    const std::vector<unsigned long> openIds = FindTaskManagerProcessIds();
+    const std::unordered_set<unsigned long> open(openIds.begin(), openIds.end());
+
+    bool increased = false;
+    for (unsigned long processId : openIds) {
+        if (g_app.taskmgrProcessIds.insert(processId).second) {
+            increased = true;
+        }
+    }
+    for (auto it = g_app.taskmgrProcessIds.begin(); it != g_app.taskmgrProcessIds.end();) {
+        if (open.find(*it) == open.end()) {
+            it = g_app.taskmgrProcessIds.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return increased;
+}
+
 struct CloseTaskmgrContext {
     const std::vector<unsigned long>* processIds = nullptr;
 };
@@ -427,21 +500,7 @@ void CloseTaskManagerInstances()
         return;
     }
 
-    std::vector<unsigned long> processIds;
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W process = {};
-        process.dwSize = sizeof(process);
-        if (Process32FirstW(snapshot, &process) != FALSE) {
-            do {
-                if (_wcsicmp(process.szExeFile, L"taskmgr.exe") == 0 &&
-                    process.th32ProcessID != GetCurrentProcessId()) {
-                    processIds.push_back(process.th32ProcessID);
-                }
-            } while (Process32NextW(snapshot, &process) != FALSE);
-        }
-        CloseHandle(snapshot);
-    }
+    std::vector<unsigned long> processIds = FindTaskManagerProcessIds();
     if (processIds.empty()) {
         return;
     }
@@ -641,14 +700,16 @@ void UpdateTrayTip()
     case SessionMode::Recording: {
         const ULONGLONG elapsedSeconds = (GetTickCount64() - g_app.recordingStart) / 1000;
         wchar_t tip[128] = {};
-        swprintf_s(tip, L"wxr-vid-cap - recording %02llu:%02llu", elapsedSeconds / 60, elapsedSeconds % 60);
+        swprintf_s(tip, L"wxr-vid-cap - recording %02llu:%02llu%s", elapsedSeconds / 60, elapsedSeconds % 60,
+                   g_app.recorder.Recovering() ? L" (re-hooking)" : L"");
         wcsncpy_s(data.szTip, tip, _TRUNCATE);
         break;
     }
     case SessionMode::Casting: {
         const ULONGLONG elapsedSeconds = (GetTickCount64() - g_app.recordingStart) / 1000;
         wchar_t tip[128] = {};
-        swprintf_s(tip, L"wxr-vid-cap - casting %02llu:%02llu", elapsedSeconds / 60, elapsedSeconds % 60);
+        swprintf_s(tip, L"wxr-vid-cap - casting %02llu:%02llu%s", elapsedSeconds / 60, elapsedSeconds % 60,
+                   g_app.caster.Recovering() ? L" (re-hooking)" : L"");
         wcsncpy_s(data.szTip, tip, _TRUNCATE);
         break;
     }
@@ -857,6 +918,18 @@ void UpdateCaptureSourceControls(HWND dialog)
     EnableWindow(GetDlgItem(dialog, IDC_BROWSE), launch);
 }
 
+// The three source choices are one logical radio group but are separated by the list, buttons, and
+// labels in the dialog template. Wine's dialog manager does not always treat them as one group, so
+// enforce exclusivity explicitly instead of relying on automatic radio grouping.
+void SelectCaptureTargetMode(HWND dialog, int checkedId)
+{
+    CheckDlgButton(dialog, IDC_TARGET_TOPMOST,
+                   checkedId == IDC_TARGET_TOPMOST ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dialog, IDC_TARGET_EXE, checkedId == IDC_TARGET_EXE ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dialog, IDC_TARGET_LAUNCH,
+                   checkedId == IDC_TARGET_LAUNCH ? BST_CHECKED : BST_UNCHECKED);
+}
+
 void SetSelectedProcessPath(HWND dialog, CaptureSourceDialogContext* context)
 {
     const LRESULT index = SendDlgItemMessageW(dialog, IDC_PROCESS_LIST, LB_GETCURSEL, 0, 0);
@@ -958,8 +1031,7 @@ INT_PTR CALLBACK CaptureSourceDialogProc(HWND dialog, UINT message, WPARAM wPara
             SendMessageW(list, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
         }
 
-        CheckRadioButton(dialog, IDC_TARGET_TOPMOST, IDC_TARGET_LAUNCH,
-                         specific ? IDC_TARGET_EXE : IDC_TARGET_TOPMOST);
+        SelectCaptureTargetMode(dialog, specific ? IDC_TARGET_EXE : IDC_TARGET_TOPMOST);
         const std::wstring& saved = context->settings->captureTargetExe;
         if (!specific && !saved.empty() && GetFileAttributesW(saved.c_str()) != INVALID_FILE_ATTRIBUTES) {
             SetDlgItemTextW(dialog, IDC_LAUNCH_PATH, saved.c_str());
@@ -979,6 +1051,11 @@ INT_PTR CALLBACK CaptureSourceDialogProc(HWND dialog, UINT message, WPARAM wPara
         case IDC_TARGET_TOPMOST:
         case IDC_TARGET_EXE:
         case IDC_TARGET_LAUNCH: {
+            // Wine can leave two auto-radio buttons checked when they are separated by other
+            // controls in the template; force the clicked mode to be the only selected one.
+            if (HIWORD(wParam) == BN_CLICKED) {
+                SelectCaptureTargetMode(dialog, static_cast<int>(LOWORD(wParam)));
+            }
             auto* context = reinterpret_cast<CaptureSourceDialogContext*>(GetWindowLongPtrW(dialog, GWLP_USERDATA));
             const bool running = (IsDlgButtonChecked(dialog, IDC_TARGET_EXE) == BST_CHECKED);
             if (running) {
@@ -1008,7 +1085,7 @@ INT_PTR CALLBACK CaptureSourceDialogProc(HWND dialog, UINT message, WPARAM wPara
             std::wstring path = current;
             if (BrowseForApplication(dialog, path)) {
                 SetDlgItemTextW(dialog, IDC_LAUNCH_PATH, path.c_str());
-                CheckRadioButton(dialog, IDC_TARGET_TOPMOST, IDC_TARGET_LAUNCH, IDC_TARGET_LAUNCH);
+                SelectCaptureTargetMode(dialog, IDC_TARGET_LAUNCH);
                 SendDlgItemMessageW(dialog, IDC_PROCESS_LIST, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
                 SetDlgItemTextW(dialog, IDC_TARGET_PATH, L"");
                 UpdateCaptureSourceControls(dialog);
@@ -1383,7 +1460,10 @@ void BeginRecordLocal()
     SetTimer(g_app.window, kSessionTimerId, 1000, nullptr);
     UpdateTrayTip();
     UpdateMainWindow();
-    const std::wstring detail = L"Saving to:\n" + path + L"\nCapture: " + g_app.recorder.Backend();
+    const std::wstring capture =
+        g_app.recorder.Source().empty() ? L"waiting for a source (NO SOURCE video, silent audio)"
+                                        : g_app.recorder.Backend();
+    const std::wstring detail = L"Saving to:\n" + path + L"\nCapture: " + capture;
     ShowBalloon(L"Recording started", detail.c_str(), NIIF_INFO);
 }
 
@@ -1626,7 +1706,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         ShowMainWindow();
         return 0;
     case kTaskmgrShownMessage:
-        ShowMainWindow();
+        if (RefreshTaskmgrInstances()) {
+            ShowMainWindow();
+        }
         return 0;
     case WM_TIMER:
         if (wParam == kSessionTimerId && g_app.mode == SessionMode::Recording) {
@@ -1647,6 +1729,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             }
             UpdateTrayTip();
             UpdateMainWindow();
+        } else if (wParam == kTaskmgrPollTimerId) {
+            if (RefreshTaskmgrInstances()) {
+                ShowMainWindow();
+            }
         }
         return 0;
     case WM_COMMAND:
@@ -1657,6 +1743,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        KillTimer(g_app.window, kTaskmgrPollTimerId);
         UninstallTaskmgrWatcher();
         RemoveTrayIcon();
         if (g_app.instanceMutex != nullptr) {
@@ -1765,6 +1852,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE /*previousInstance*/, PWSTR /*
     }
 
     InstallTaskmgrWatcher();
+    // Seed the count with instances that predate us: only a *new* taskmgr should open SHOW.
+    RefreshTaskmgrInstances();
+    SetTimer(g_app.window, kTaskmgrPollTimerId, kTaskmgrPollIntervalMs, nullptr);
 
     MSG message = {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

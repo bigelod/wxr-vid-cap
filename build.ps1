@@ -4,7 +4,10 @@
 #   .\build.ps1 -Configuration Debug
 
 param(
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    # Where the on-device app folder lives. build.ps1 refreshes its DeployReady subfolder with the
+    # shipping app files when the path exists; pass -DeployRoot "" to skip.
+    [string]$DeployRoot = "E:\tmp\WXRVIDCAP"
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +19,20 @@ if (-not (Test-Path $msbuild)) {
 }
 
 $solutionDir = "$($root.Replace('\', '/'))/"
+
+function Copy-IfChanged([string]$source, [string]$destination) {
+    if (-not (Test-Path $source)) {
+        throw "Missing build output: $source"
+    }
+    if (Test-Path $destination) {
+        $sourceHash = (Get-FileHash $source -Algorithm SHA256).Hash
+        $destinationHash = (Get-FileHash $destination -Algorithm SHA256).Hash
+        if ($sourceHash -eq $destinationHash) {
+            return
+        }
+    }
+    Copy-Item $source $destination -Force
+}
 
 function Build-Project([string]$project, [string]$platform) {
     Write-Host "== $project ($platform, $Configuration)"
@@ -50,6 +67,9 @@ Copy-Item "$root\build\tools\x64\$Configuration\wxr_hook_dll.dll" "$root\build\x
 Copy-Item "$root\build\tools\Win32\$Configuration\wxr_hook_dll32.dll" "$root\build\x64\$Configuration\wxr_hook_dll32.dll" -Force
 Copy-Item "$root\build\tools\Win32\$Configuration\wxr_inject32.exe" "$root\build\x64\$Configuration\wxr_inject32.exe" -Force
 Copy-Item "$root\src\capture-blacklist.txt" "$root\build\x64\$Configuration\capture-blacklist.txt" -Force
+Copy-Item "$root\src\no-source.bmp" "$root\build\x64\$Configuration\no-source.bmp" -Force
+Copy-Item "$root\src\no-source.bmp" "$root\build\tools\x64\$Configuration\no-source.bmp" -Force
+Copy-Item "$root\src\no-source.bmp" "$root\build\testapps\$Configuration\no-source.bmp" -Force
 
 # Capture test apps (one per graphics API) and the automated runner.
 foreach ($app in @("cube_d3d7", "cube_d3d8", "cube_d3d9", "cube_d3d10", "cube_d3d11", "cube_d3d12", "cube_ddraw", "cube_gl", "cube_vk", "cube_runner")) {
@@ -61,6 +81,45 @@ foreach ($app in @("cube_d3d7", "cube_d3d8", "cube_d3d9", "cube_d3d10", "cube_d3
 foreach ($app in @("cube_d3d7", "cube_d3d8", "cube_d3d9", "cube_d3d10", "cube_d3d11", "cube_d3d12", "cube_ddraw", "cube_gl")) {
     Build-Project "tools\testapps\$app.vcxproj" "Win32"
     Copy-Item "$root\build\testapps\Win32\$Configuration\${app}32.exe" "$root\build\testapps\$Configuration\${app}32.exe" -Force
+}
+
+# Shipping layout: only the files the tray app needs at runtime, with no cube test apps. Keep a
+# copy under the on-device folder so it can be copied to a container as a single folder.
+if ($DeployRoot -ne "" -and (Test-Path $DeployRoot)) {
+    $deployReady = Join-Path $DeployRoot "DeployReady"
+    New-Item -ItemType Directory -Force -Path $deployReady | Out-Null
+    Get-ChildItem $deployReady -File | Remove-Item -Force -ErrorAction SilentlyContinue
+    $shipping = @(
+        "wxr-vid-cap.exe",
+        "wxr_hook_dll.dll",
+        "wxr_hook_dll32.dll",
+        "wxr_inject32.exe",
+        "wxr_launch.exe",
+        "wxr_launch32.exe",
+        "openh264.dll",
+        "capture-blacklist.txt",
+        "no-source.bmp"
+    )
+    foreach ($name in $shipping) {
+        Copy-IfChanged "$root\build\x64\$Configuration\$name" (Join-Path $deployReady $name)
+    }
+    Write-Host "Shipping files: $deployReady"
+
+    # Debug layout: the tray app plus the cube runner and every capture test app, so DebugVersion is
+    # a complete on-device test installation. Test runs write into the sibling NovTests folder.
+    $debugVersion = Join-Path $DeployRoot "DebugVersion"
+    New-Item -ItemType Directory -Force -Path $debugVersion | Out-Null
+    Get-ChildItem $debugVersion -File | Remove-Item -Force -ErrorAction SilentlyContinue
+    foreach ($name in $shipping) {
+        Copy-IfChanged "$root\build\x64\$Configuration\$name" (Join-Path $debugVersion $name)
+    }
+    Copy-IfChanged "$root\build\tools\x64\$Configuration\record_5s.exe" (Join-Path $debugVersion "record_5s.exe")
+    Copy-IfChanged "$root\build\testapps\$Configuration\cube_runner.exe" (Join-Path $debugVersion "cube_runner.exe")
+    Get-ChildItem "$root\build\testapps\$Configuration" -Filter "cube_*.exe" | ForEach-Object {
+        Copy-IfChanged $_.FullName (Join-Path $debugVersion $_.Name)
+    }
+    New-Item -ItemType Directory -Force -Path (Join-Path $DeployRoot "NovTests") | Out-Null
+    Write-Host "Debug files:    $debugVersion"
 }
 
 Write-Host ""

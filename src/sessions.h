@@ -21,6 +21,7 @@ public:
     void Stop();
 
     bool Active() const;
+    bool Recovering() const;
     bool LastStopWroteFile() const;
     const std::wstring& Path() const;
     const std::wstring& Backend() const;
@@ -49,10 +50,11 @@ public:
     void Stop();
 
     // Switches the live cast to another capture source. An empty executable means the top-most
-    // window (GDI); otherwise the caster tries the hook first and falls back to GDI.
+    // window; otherwise the caster keeps retrying that application while it is running.
     bool ChangeSource(const std::wstring& targetExecutable, std::wstring& error);
 
     bool Active() const;
+    bool Recovering() const;
     const std::wstring& Backend() const;
     const std::wstring& LastError() const;
     std::wstring Source() const;

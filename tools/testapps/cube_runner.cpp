@@ -1,9 +1,12 @@
 // Runs every capture test app in sequence, records a short clip of each through the normal
-// Recorder path (hook first, GDI fallback), keeps every MKV, and writes one combined log.
+// hook-only Recorder path, keeps every MKV, and writes one combined log.
 //
-// Launch it and leave it alone. At the end it shows a summary and the output folder.
+// Each run writes into the deployment root's NovTests\<timestamp> folder by default: the exe
+// normally sits in DebugVersion, so the parent of its directory is the root. Use --out-root <path>
+// to override. Launch it and leave it alone; at the end it shows a summary and the output folder.
 
 #include <windows.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 
 #include <cstdio>
@@ -25,7 +28,7 @@ struct TestCase {
 const TestCase kTests[] = {
     {L"d3d7", L"cube_d3d7.exe"},   {L"d3d8", L"cube_d3d8.exe"},   {L"d3d9", L"cube_d3d9.exe"},
     {L"d3d10", L"cube_d3d10.exe"}, {L"d3d11", L"cube_d3d11.exe"}, {L"d3d12", L"cube_d3d12.exe"},
-    {L"gl", L"cube_gl.exe"},       {L"vk", L"cube_vk.exe"},
+    {L"ddraw", L"cube_ddraw.exe"}, {L"gl", L"cube_gl.exe"},       {L"vk", L"cube_vk.exe"},
 };
 
 std::filesystem::path ExecutableDirectory()
@@ -237,7 +240,20 @@ std::string TrimPrefix(const std::string& line, const std::string& prefix)
 int WINAPI wWinMain(HINSTANCE /*instance*/, HINSTANCE /*previous*/, PWSTR /*commandLine*/, int /*show*/)
 {
     const std::filesystem::path directory = ExecutableDirectory();
-    const std::filesystem::path outputDirectory = directory / L"cube_tests" / TimestampName();
+
+    std::filesystem::path outputRoot = directory.parent_path() / L"NovTests";
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv != nullptr) {
+        for (int i = 1; i < argc; ++i) {
+            if (_wcsicmp(argv[i], L"--out-root") == 0 && i + 1 < argc) {
+                outputRoot = argv[++i];
+            }
+        }
+        LocalFree(argv);
+    }
+
+    const std::filesystem::path outputDirectory = outputRoot / TimestampName();
     std::error_code error;
     std::filesystem::create_directories(outputDirectory, error);
 
@@ -473,6 +489,14 @@ int WINAPI wWinMain(HINSTANCE /*instance*/, HINSTANCE /*previous*/, PWSTR /*comm
             if (!errorLine.empty()) {
                 logLine("  " + errorLine);
             }
+            ++failed;
+            continue;
+        }
+
+        // The shipping recorder is hook-only. A clip from an older record_5s.exe that fell back to
+        // GDI looks fine in the log but is blank/white for GPU-rendered windows, so reject it.
+        if (backend.find("GDI") != std::string::npos || hook.find("GDI") != std::string::npos) {
+            logLine("  FAILED: recorder fell back to GDI; use the current record_5s.exe");
             ++failed;
             continue;
         }

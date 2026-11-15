@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -41,6 +42,8 @@ constexpr int kHookRetryTimeoutMs = 1500;
 constexpr int kSourceRetryIntervalMs = 3000;
 constexpr int kHookStallFrames = kCaptureFps * 5;
 constexpr int kTargetMissingLimit = 3;
+constexpr ULONGLONG kFootageLostMs = 2000;
+constexpr ULONGLONG kRecoveryIntervalMs = 2000;
 
 std::string Narrow(const std::wstring& text)
 {
@@ -53,6 +56,91 @@ std::string Narrow(const std::wstring& text)
         WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, result.data(), size, nullptr, nullptr);
     }
     return result;
+}
+
+std::wstring ExecutableDirectory()
+{
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring directory(path);
+    const std::size_t slash = directory.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        directory.resize(slash);
+    }
+    return directory;
+}
+
+// Reads the pre-rendered NO SOURCE frame. Only uncompressed 24/32-bit BMPs are supported, which is
+// what the shipped asset uses; a missing or invalid file falls back to a plain dark frame.
+bool LoadNoSourceBmp(const std::wstring& path, int width, int height, std::vector<std::uint8_t>& bgra)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    const std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(file)),
+                                         std::istreambuf_iterator<char>());
+    if (data.size() < 54 || data[0] != 'B' || data[1] != 'M') {
+        return false;
+    }
+
+    const auto u16 = [](const std::uint8_t* p) {
+        return static_cast<std::uint16_t>(p[0] | (p[1] << 8));
+    };
+    const auto u32 = [](const std::uint8_t* p) {
+        return static_cast<std::uint32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
+    };
+
+    const std::uint32_t offset = u32(data.data() + 10);
+    const std::uint32_t headerSize = u32(data.data() + 14);
+    const std::int32_t bmpWidth = static_cast<std::int32_t>(u32(data.data() + 18));
+    const std::int32_t bmpHeight = static_cast<std::int32_t>(u32(data.data() + 22));
+    const std::uint16_t bpp = u16(data.data() + 28);
+    const std::uint32_t compression = u32(data.data() + 30);
+    const int absoluteHeight = bmpHeight < 0 ? -bmpHeight : bmpHeight;
+    if (headerSize < 40 || bmpWidth != width || absoluteHeight != height ||
+        (bpp != 24 && bpp != 32) || compression != 0) {
+        return false;
+    }
+
+    const std::size_t rowBytes =
+        ((static_cast<std::size_t>(bmpWidth) * bpp + 31) / 32) * 4;
+    if (offset + rowBytes * static_cast<std::size_t>(height) > data.size()) {
+        return false;
+    }
+
+    bgra.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+    const int bytesPerPixel = bpp / 8;
+    const bool topDown = bmpHeight < 0;
+    for (int y = 0; y < height; ++y) {
+        const int sourceRow = topDown ? y : height - 1 - y;
+        const std::uint8_t* source = data.data() + offset + rowBytes * static_cast<std::size_t>(sourceRow);
+        std::uint8_t* destination = bgra.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4;
+        for (int x = 0; x < width; ++x) {
+            const std::uint8_t* pixel = source + static_cast<std::size_t>(x) * bytesPerPixel;
+            destination[x * 4 + 0] = pixel[0];
+            destination[x * 4 + 1] = pixel[1];
+            destination[x * 4 + 2] = pixel[2];
+            destination[x * 4 + 3] = (bytesPerPixel == 4 && pixel[3] != 0) ? pixel[3] : 255;
+        }
+    }
+    return true;
+}
+
+// Loads no-source.bmp beside the executable; if it is missing, the caller still gets a valid frame.
+bool LoadNoSourceFrame(int width, int height, std::vector<std::uint8_t>& frame)
+{
+    if (LoadNoSourceBmp(ExecutableDirectory() + L"\\no-source.bmp", width, height, frame)) {
+        return true;
+    }
+    frame.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4, 0);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(width) * static_cast<std::size_t>(height); ++i) {
+        frame[i * 4 + 0] = 16;
+        frame[i * 4 + 1] = 16;
+        frame[i * 4 + 2] = 16;
+        frame[i * 4 + 3] = 255;
+    }
+    return false;
 }
 
 std::wstring FileNameOf(const std::wstring& path)
@@ -258,6 +346,7 @@ struct Recorder::Impl {
     std::thread thread;
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> active{false};
+    std::atomic<bool> recovering{false};
     bool wroteFile = false;
     std::wstring error;
 
@@ -318,6 +407,11 @@ void Recorder::Stop()
 bool Recorder::Active() const
 {
     return impl_ && impl_->active.load();
+}
+
+bool Recorder::Recovering() const
+{
+    return impl_ && impl_->recovering.load();
 }
 
 bool Recorder::LastStopWroteFile() const
@@ -388,28 +482,28 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
 
     if (targetExecutable.empty()) {
         targetExecutable = TopMostWindowExecutable();
-        if (targetExecutable.empty()) {
-            fail(L"No capturable window is running.");
-            return;
-        }
     }
 
-    if (!hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, initError, hookTimeoutMs, retryTimeoutMs)) {
-        logLine("error: " + Narrow(initError));
-        fail(L"Could not start the graphics hook: " + initError);
-        return;
-    }
-
-    bool hookActive = true;
+    bool hookActive = false;
     backend = L"graphics hook";
-    {
-        std::lock_guard<std::mutex> lock(sourceMutex);
-        currentSource = targetExecutable;
+    if (!targetExecutable.empty()) {
+        if (!hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, initError, hookTimeoutMs, retryTimeoutMs)) {
+            logLine("source: initial hook failed; recording NO SOURCE and retrying: " + Narrow(initError));
+            initError.clear();
+        } else {
+            hookActive = true;
+            {
+                std::lock_guard<std::mutex> lock(sourceMutex);
+                currentSource = targetExecutable;
+            }
+            logLine("hook: " + Narrow(hook.LastInjectionMethod()) + ", source " +
+                    std::to_string(hook.SourceWidth()) + "x" + std::to_string(hook.SourceHeight()));
+            logLine("target: " + Narrow(targetExecutable));
+        }
+    } else {
+        logLine("source: no capturable window; recording NO SOURCE and waiting");
     }
     logLine("backend: graphics hook");
-    logLine("hook: " + Narrow(hook.LastInjectionMethod()) + ", source " +
-            std::to_string(hook.SourceWidth()) + "x" + std::to_string(hook.SourceHeight()));
-    logLine("target: " + Narrow(targetExecutable));
 
     H264Encoder encoder;
     if (!encoder.Initialize(kCaptureWidth, kCaptureHeight, kCaptureFps, kVideoBitrateKbps, initError)) {
@@ -464,9 +558,19 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     bool contentLogged = false;
     bool lastContentBlack = false;
     int hookEmptyFrames = 0;
-    int targetMissingChecks = 0;
-    bool rehooked = false;
+    ULONGLONG lastFrameTick = GetTickCount64();
+    ULONGLONG lastRecoveryAttempt = 0;
+    ULONGLONG lastFullRehook = 0;
+    recovering = false;
     std::vector<std::uint8_t> frame;
+    std::vector<std::uint8_t> noSourceFrame;
+    if (LoadNoSourceFrame(kCaptureWidth, kCaptureHeight, noSourceFrame)) {
+        logLine("source: loaded no-source.bmp");
+    } else {
+        logLine("source: no-source.bmp missing or invalid; using a dark frame");
+    }
+    bool footageLive = false;
+    bool showingNoSource = false;
 
     const int audioChannels = audioEnabled ? audio.Channels() : 0;
     const int audioRate = audioEnabled ? opus.SampleRate() : 0;
@@ -475,11 +579,32 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     std::size_t audioOffset = 0;
     std::int64_t audioSamplesEncoded = 0;
 
-    auto drainAudio = [&](std::int64_t upToPts) -> bool {
+    auto drainAudio = [&](std::int64_t upToPts, bool silent) -> bool {
         std::vector<std::int16_t> captured;
         if (!audio.Read(captured, error)) {
             return false;
         }
+
+        if (silent) {
+            // Keep the audio clock running with silence while no footage is available.
+            static std::vector<std::int16_t> silence;
+            silence.assign(static_cast<std::size_t>(opusFrameSamples) * static_cast<std::size_t>(audioChannels), 0);
+            const std::int64_t targetSamples = audioRate > 0 ? upToPts * audioRate / 90000 : 0;
+            while (opusFrameSamples > 0 && audioSamplesEncoded + opusFrameSamples <= targetSamples) {
+                const std::int64_t pts = audioSamplesEncoded * 90000 / audioRate;
+                std::vector<std::uint8_t> packet;
+                if (!opus.Encode(silence.data(), opusFrameSamples, packet, error)) {
+                    return false;
+                }
+                if (!writer.WriteAudioFrame(packet.data(), packet.size(), pts)) {
+                    error = L"Audio muxing failed.";
+                    return false;
+                }
+                audioSamplesEncoded += opusFrameSamples;
+            }
+            return true;
+        }
+
         std::vector<std::int16_t> resampled;
         resampler.Process(captured, resampled);
         audioBuffer.insert(audioBuffer.end(), resampled.begin(), resampled.end());
@@ -519,13 +644,11 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         hook.Stop();
         hookActive = false;
         hookEmptyFrames = 0;
-        targetMissingChecks = 0;
 
         const bool sameTarget =
             !newSource.empty() && _wcsicmp(newSource.c_str(), targetExecutable.c_str()) == 0;
         if (newSource.empty() || sameTarget) {
-            error = L"The capture target closed and no other hookable window was found.";
-            logLine("source: no replacement target; stopping");
+            logLine("source: no replacement target; recording NO SOURCE");
             return false;
         }
 
@@ -538,7 +661,6 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
 
         targetExecutable = newSource;
         hookActive = true;
-        rehooked = true;
         backend = L"graphics hook";
         logLine("source: re-hooked to " + Narrow(newSource));
 
@@ -561,75 +683,126 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
 
         if (audioEnabled && frameIndex > 0) {
             const auto audioStart = std::chrono::steady_clock::now();
-            if (!drainAudio(pts)) {
+            if (!drainAudio(pts, !footageLive)) {
                 break;
             }
             audioMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audioStart).count();
         }
 
-        if (!targetExecutable.empty() && frameIndex > 0 && frameIndex % kCaptureFps == 0 &&
-            (!hookActive || hookEmptyFrames > 0)) {
+        const ULONGLONG now = GetTickCount64();
+
+        // No target selected/resolved yet: look for a capturable window and keep recording blank.
+        if (targetExecutable.empty() && now - lastRecoveryAttempt >= kRecoveryIntervalMs) {
+            lastRecoveryAttempt = now;
+            targetExecutable = TopMostWindowExecutable();
+            if (!targetExecutable.empty()) {
+                logLine("source: found a capturable window; attempting to hook " + Narrow(targetExecutable));
+            } else if (!recovering) {
+                recovering = true;
+                logLine("source: no capturable window; recording NO SOURCE");
+            }
+        }
+
+        const bool footageLost = hookActive && (now - lastFrameTick >= kFootageLostMs);
+        if (!targetExecutable.empty() && !IsExcludedExecutablePath(targetExecutable) &&
+            (!hookActive || footageLost) && now - lastRecoveryAttempt >= kRecoveryIntervalMs) {
+            lastRecoveryAttempt = now;
             const bool targetOpen = FindProcessByExecutable(targetExecutable) != 0;
             if (!targetOpen) {
-                // The selected app is gone; the existing fallback may look for a replacement.
-                if (++targetMissingChecks >= 3) {
-                    if (!switchSource(TopMostWindowExecutable())) {
-                        break;
+                const std::wstring replacement = TopMostWindowExecutable();
+                if (!replacement.empty() && _wcsicmp(replacement.c_str(), targetExecutable.c_str()) != 0) {
+                    if (switchSource(replacement)) {
+                        lastFrameTick = GetTickCount64();
+                        recovering = false;
+                    } else {
+                        error.clear();
+                        if (!recovering) {
+                            recovering = true;
+                            logLine("source: replacement hook failed; recording NO SOURCE");
+                        }
                     }
+                } else if (!recovering) {
+                    recovering = true;
+                    logLine("source: selected app is not running; recording NO SOURCE");
                 }
-            } else if (!hookActive || !TargetStillPresent(targetExecutable, hook.ProcessId()) ||
-                       hookEmptyFrames >= kCaptureFps * 5) {
-                // The selected app is still running. Re-hook that same app instead of switching to
-                // whatever happens to be in front; top-most resolution is unreliable in Winlator.
-                if (++targetMissingChecks >= 3) {
-                    targetMissingChecks = 0;
-                    logLine("source: target still open; re-hooking the same application");
+            } else {
+                if (!recovering) {
+                    recovering = true;
+                    logLine("source: no footage; attempting to reattach");
+                }
+                const ULONGLONG lostAt = lastFrameTick;
+                if (hook.Reattach(1000)) {
+                    hookActive = true;
+                    hookEmptyFrames = 0;
+                    lastFrameTick = GetTickCount64();
+                    logLine("source: footage recovered after rescan (" +
+                            std::to_string(lastFrameTick - lostAt) + " ms)");
+                } else if (now - lastFullRehook >= 10000) {
+                    // Re-injecting is heavier than a rescan; do it only every 10 s while the app is
+                    // alive so a paused/loading game does not get a remote thread every two seconds.
+                    lastFullRehook = now;
                     hook.Stop();
                     hookActive = false;
                     std::wstring retryError;
                     if (hook.Start(targetExecutable, kCaptureWidth, kCaptureHeight, retryError, 3000, 0)) {
                         hookActive = true;
                         hookEmptyFrames = 0;
+                        lastFrameTick = GetTickCount64();
                         backend = L"graphics hook";
                         {
                             std::lock_guard<std::mutex> lock(sourceMutex);
                             currentSource = targetExecutable;
                         }
-                        std::wstring encoderError;
-                        if (!encoder.Initialize(kCaptureWidth, kCaptureHeight, kCaptureFps, kVideoBitrateKbps,
-                                                encoderError)) {
-                            error = L"Could not restart the video encoder after re-hooking the target: " +
-                                    encoderError;
-                            break;
-                        }
-                        logLine("source: re-hooked the same application");
+                        logLine("source: footage recovered after re-hooking the same application");
                     } else {
-                        logLine("source: same-app re-hook failed; will retry: " + Narrow(retryError));
+                        logLine("source: re-hook failed; will retry: " + Narrow(retryError));
                     }
                 }
-            } else {
-                targetMissingChecks = 0;
             }
         } else if (hookEmptyFrames == 0) {
-            targetMissingChecks = 0;
-        }
-
-        if (hookActive && rehooked && hookEmptyFrames >= 48) {
-            error = L"The re-hooked capture target stopped producing frames.";
-            logLine("source: re-hooked target stopped producing frames; stopping");
-            break;
+            // Healthy.
         }
 
         const auto captureStart = std::chrono::steady_clock::now();
-        if (hook.Capture(frame, 20, error)) {
-            hookEmptyFrames = 0;
+        const std::vector<std::uint8_t>* sourceFrame = &noSourceFrame;
+        if (hookActive) {
+            if (hook.Capture(frame, 20, error)) {
+                hookEmptyFrames = 0;
+                lastFrameTick = GetTickCount64();
+                lastFullRehook = 0;
+                footageLive = true;
+                sourceFrame = &frame;
+                if (showingNoSource) {
+                    showingNoSource = false;
+                    logLine("source: live footage restored");
+                }
+                if (recovering) {
+                    recovering = false;
+                    logLine("source: footage recovered");
+                }
+            } else {
+                footageLive = false;
+                ++hookEmptyFrames;
+                if (hookEmptyFrames == 48) {
+                    logLine("hook: no frames for 2 s");
+                }
+                // Hold the last good frame briefly so a single missed Present does not flash.
+                if (!frame.empty() && GetTickCount64() - lastFrameTick < 500) {
+                    sourceFrame = &frame;
+                } else if (!showingNoSource) {
+                    showingNoSource = true;
+                    logLine("source: displaying NO SOURCE");
+                }
+            }
         } else {
-            ++hookEmptyFrames;
-            if (hookEmptyFrames == 48) {
-                logLine("hook: no frames for 2 s; repeating the last frame");
+            footageLive = false;
+            if (!showingNoSource) {
+                showingNoSource = true;
+                logLine("source: displaying NO SOURCE");
             }
         }
-        if (frame.size() != static_cast<std::size_t>(kCaptureWidth) * static_cast<std::size_t>(kCaptureHeight) * 4) {
+        if (sourceFrame->size() !=
+            static_cast<std::size_t>(kCaptureWidth) * static_cast<std::size_t>(kCaptureHeight) * 4) {
             error = L"No frames are available from the capture target.";
             break;
         }
@@ -639,7 +812,7 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
 
         const auto convertStart = std::chrono::steady_clock::now();
         std::vector<std::uint8_t> i420;
-        if (!BgraToI420(frame.data(), kCaptureWidth, kCaptureHeight, i420)) {
+        if (!BgraToI420(sourceFrame->data(), kCaptureWidth, kCaptureHeight, i420)) {
             error = L"Frame conversion failed.";
             break;
         }
@@ -663,17 +836,18 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
             ++framesWritten;
         }
 
-        const bool contentBlack = IsMostlyBlack(frame.data(), kCaptureWidth, kCaptureHeight);
+        const bool contentBlack = IsMostlyBlack(sourceFrame->data(), kCaptureWidth, kCaptureHeight);
         if (!contentLogged || contentBlack != lastContentBlack) {
-            logLine(contentBlack ? "content: black (capture may be missing a GPU-rendered surface)"
-                                 : "content: visible");
+            logLine(showingNoSource ? "content: NO SOURCE frame"
+                                    : (contentBlack ? "content: black (capture may be missing a GPU-rendered surface)"
+                                                    : "content: visible"));
             lastContentBlack = contentBlack;
             contentLogged = true;
         }
 
         if (audioEnabled && frameIndex == 0) {
             const auto audioStart = std::chrono::steady_clock::now();
-            if (!drainAudio(0)) {
+            if (!drainAudio(0, !footageLive)) {
                 break;
             }
             audioMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audioStart).count();
@@ -688,7 +862,7 @@ void Recorder::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     if (audioEnabled) {
         if (error.empty()) {
             const auto audioStart = std::chrono::steady_clock::now();
-            drainAudio(std::numeric_limits<std::int64_t>::max());
+            drainAudio(std::numeric_limits<std::int64_t>::max(), !footageLive);
             audioMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audioStart).count();
         }
         audio.Stop();
@@ -733,6 +907,7 @@ struct Caster::Impl {
     std::thread thread;
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> active{false};
+    std::atomic<bool> recovering{false};
     std::mutex sourceMutex;
     std::wstring pendingSource;
     std::atomic<bool> sourceChangeRequested{false};
@@ -806,6 +981,11 @@ void Caster::Stop()
 bool Caster::Active() const
 {
     return impl_ && impl_->active.load();
+}
+
+bool Caster::Recovering() const
+{
+    return impl_ && impl_->recovering.load();
 }
 
 const std::wstring& Caster::Backend() const
@@ -883,10 +1063,17 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
     int hookEmptyFrames = 0;
     int targetMissingChecks = 0;
     ULONGLONG nextRetry = GetTickCount64() + 1000;
+    ULONGLONG lastReattachAttempt = 0;
     std::vector<std::uint8_t> frame;
     const std::size_t frameBytes =
         static_cast<std::size_t>(kCaptureWidth) * static_cast<std::size_t>(kCaptureHeight) * 4;
-    std::vector<std::uint8_t> blankFrame(frameBytes, 0);
+    std::vector<std::uint8_t> blankFrame;
+    if (LoadNoSourceFrame(kCaptureWidth, kCaptureHeight, blankFrame)) {
+        trace(L"source: loaded no-source.bmp");
+    } else {
+        blankFrame.assign(frameBytes, 0);
+        trace(L"source: no-source.bmp missing; using black frame");
+    }
 
     std::mutex retryMutex;
     std::unique_ptr<HookCapture> pendingHook;
@@ -924,6 +1111,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
 
         targetExecutable = candidate;
         hookActive = true;
+        recovering = false;
         resetEncoder = true;
         hookEmptyFrames = 0;
         targetMissingChecks = 0;
@@ -949,6 +1137,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         targetMissingChecks = 0;
         // Keep desiredTarget: a selected app is retried for as long as the cast runs, even if its
         // process is temporarily gone. Only an explicit source change replaces it.
+        recovering = false;
         resetEncoder = true;
         nextRetry = GetTickCount64();
         frame.clear();
@@ -1179,6 +1368,19 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
             targetMissingChecks = 0;
         }
 
+        if (hookActive && hook && hookEmptyFrames >= kCaptureFps * 2 &&
+            GetTickCount64() - lastReattachAttempt >= 2000) {
+            lastReattachAttempt = GetTickCount64();
+            recovering = true;
+            trace(L"hook: footage lost; asking the resident hook to rescan");
+            if (hook->Reattach(500)) {
+                hookEmptyFrames = 0;
+                trace(L"hook: footage recovered after rescan");
+            } else {
+                trace(L"hook: rescan did not restore frames");
+            }
+        }
+
         if (hookActive && hookEmptyFrames >= kHookStallFrames) {
             trace(L"hook: no frames for 5 s; dropping source and retrying");
             enterWaiting();
@@ -1266,6 +1468,7 @@ void Caster::Impl::Run(std::promise<std::pair<bool, std::wstring>> ready)
         if (hookActive && hook) {
             if (hook->Capture(frame, 20, error)) {
                 hookEmptyFrames = 0;
+                recovering = false;
                 sourceFrame = &frame;
             } else {
                 ++hookEmptyFrames;
